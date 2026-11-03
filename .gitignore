@@ -4,6 +4,7 @@ cache/
 processed/
 preprocessed/
 artifacts/
+results/
 models/
 checkpoints/
 ckpts/
@@ -27,6 +28,7 @@ __pycache__/
 *.ckpt
 *.safetensors
 *.cbm
+/gbdt_model*.txt
 *.csv
 *.zip
 *.log

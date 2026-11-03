@@ -1,511 +1,1500 @@
 # gbdt.py
+"""Single-file GBDT pipeline for the TechArena CTR task.
+
+This ports the reference project's strongest tabular recipe into one file:
+  * V6 preference features (190)
+  * warm-16 choice-factor score + decomposition + aligned factor interactions (68)
+  * warm clicked-context priors (32)
+  * exposure-aware ALS summaries + aligned ALS interactions (64)
+
+The validation rows are always scored with features built from labels strictly
+before the validation cutoff.  LightGBM then learns the candidate-level click
+probability.  Run `python gbdt.py` for validation plus the final submission.
 """
-LightGBM pipeline for TechArena CTR prediction.
+from __future__ import annotations
 
-Independent of pipeline.py (the neural network). Uses cached train.pkl / eval.pkl.
-Produces submission_gbdt.csv with rowid,predicted_probability format.
-
-Dependencies:
-    uv pip install lightgbm scipy implicit
-
-Usage:
-    uv run python gbdt.py                      # full pipeline
-    uv run python gbdt.py --skip_als           # quick test without ALS
-    uv run python gbdt.py --sample 50000       # subsample events for quick test
-"""
 import argparse
+import gc
+import json
+import math
 import pickle
 import time
 from pathlib import Path
 
+import lightgbm as lgb
 import numpy as np
 import pandas as pd
-import lightgbm as lgb
-from scipy import sparse
+from numba import njit, prange, set_num_threads
+from scipy.sparse import coo_matrix
+from sklearn.decomposition import TruncatedSVD
 from sklearn.metrics import roc_auc_score
-
-try:
-    from implicit.als import AlternatingLeastSquares
-    HAS_IMPLICIT = True
-except ImportError:
-    HAS_IMPLICIT = False
+from sklearn.preprocessing import normalize
 
 CACHE = Path("cache")
+FEAT = CACHE / "features_gbdt_v4"
+FEAT.mkdir(parents=True, exist_ok=True)
+DAY = 86400
+DATA_VERSION = 4
 
-FEATURE_COLS = [
-    # Item popularity & recency
-    'item_ctr', 'item_log_n', 'item_click_count',
-    'item_days_since_last_seen', 'item_ctr_last_3d',
-    # User activity
-    'user_n_events', 'user_log_events', 'user_ctr',
-    'user_last_active_gap_days',
-    # User-item interaction
-    'in_history', 'hist_count', 'hist_last_pos', 'hist_gap_days',
-    'als_score',
-    # Slate context
-    'position', 'n_candidates_in_history',
-    'item_ctr_rank_in_slate', 'item_ctr_minus_slate_mean',
-    'als_rank_in_slate', 'als_score_minus_slate_mean', 'is_top_als',
-    # Temporal
-    'hour_sin', 'hour_cos', 'dow_sin', 'dow_cos', 'is_weekend',
-    # History summary (event-level, broadcast to all candidates)
-    'hist_len', 'hist_unique_ratio',
-    'hist_last_item_in_slate', 'hist_overlap_ratio',
-    'item2vec_sim_max', 'item2vec_sim_mean', 'item2vec_sim_last',
-]
+
+def log(*args):
+    print(*args, flush=True)
 
 
 # ---------------------------------------------------------------------------
-# Load and split
+# Data preparation
 # ---------------------------------------------------------------------------
-def load_events():
-    train = pd.read_pickle(CACHE / "train.pkl")
-    ev    = pd.read_pickle(CACHE / "eval.pkl")
-    print(f"[load] train events={len(train):,}  eval events={len(ev):,}")
-    return train, ev
-
-
-def temporal_split(train, val_frac=0.15):
-    cut_ts = int(np.quantile(train['timestamp'].values, 1 - val_frac))
-    tr = train[train['timestamp'] <  cut_ts].reset_index(drop=True)
-    va = train[train['timestamp'] >= cut_ts].reset_index(drop=True)
-    print(f"[split] train={len(tr):,}  val={len(va):,}  "
-          f"cutoff={pd.to_datetime(cut_ts, unit='s', utc=True)}")
-    return tr, va, cut_ts
-
-
-# ---------------------------------------------------------------------------
-# Explode events to one row per (event, candidate)
-# ---------------------------------------------------------------------------
-def explode_candidates(df, has_labels=True):
+def _encode_dataframe(df, umap, imap, labelled):
     n = len(df)
-    counts = df['items'].apply(len).values
-    total = int(counts.sum())
+    user = np.fromiter((umap[x] for x in df["user_id"].values), dtype=np.int32, count=n)
+    ts = df["timestamp"].values.astype(np.int64)
+    tb = df["time_bucket"].values.astype(np.int8)
+    dt = df["day_type"].values.astype(np.int8)
 
-    event_row = np.repeat(np.arange(n), counts)
-    position  = np.concatenate([np.arange(c) for c in counts])
-    items     = np.concatenate(df['items'].values)
+    items = np.fromiter(
+        (imap[x] for row in df["items"].values for x in row),
+        dtype=np.int32,
+        count=n * 10,
+    ).reshape(n, 10)
+    hist = np.full((n, 20), -1, dtype=np.int32)
+    hts = np.full((n, 20), -1, dtype=np.int64)
+    for i, (ha, ht) in enumerate(zip(df["history_items"].values,
+                                    df["history_timestamps"].values)):
+        length = min(len(ha), 20)
+        if length:
+            hist[i, :length] = [imap[x] for x in ha[:length]]
+            hts[i, :length] = ht[:length]
 
-    out = pd.DataFrame({
-        'event_row': event_row,
-        'position':  position.astype(np.int8),
-        'user_id':   df['user_id'].values[event_row],
-        'item_id':   items,
-        'timestamp': df['timestamp'].values[event_row],
-    })
-    if has_labels:
-        out['label'] = np.concatenate(df['labels'].values).astype(np.int8)
-    else:
-        out['rowid'] = np.concatenate(df['rowids'].values)
+    labels = None
+    if labelled:
+        labels = np.fromiter(
+            (int(x) for row in df["labels"].values for x in row),
+            dtype=np.int8,
+            count=n * 10,
+        ).reshape(n, 10)
 
-    print(f"[explode] {n:,} events -> {len(out):,} candidates")
+    out = dict(user=user, ts=ts, tb=tb, dt=dt, items=items, hist=hist, hts=hts)
+    if labels is not None:
+        out["labels"] = labels
     return out
 
 
-# ---------------------------------------------------------------------------
-# Statistics (computed on training portion only — no leakage)
-# ---------------------------------------------------------------------------
-def compute_item_stats(tr_flat):
-    global_ctr = float(tr_flat['label'].mean())
-    g = tr_flat.groupby('item_id', sort=False).agg(
-        n=('label', 'size'),
-        clicks=('label', 'sum'),
-        last_ts=('timestamp', 'max'),
-    ).reset_index()
-    alpha = 5.0
-    g['item_ctr']         = ((g['clicks'] + alpha * global_ctr) / (g['n'] + alpha)).astype(np.float32)
-    g['item_log_n']       = np.log1p(g['n']).astype(np.float32)
-    g['item_click_count'] = g['clicks'].astype(np.float32)
-    return g[['item_id', 'last_ts', 'item_ctr', 'item_log_n', 'item_click_count']], global_ctr
+def prepare_data(rebuild=False):
+    data_path = CACHE / "gbdt_data.npz"
+    meta_path = CACHE / "gbdt_data_meta.json"
+    if data_path.exists() and meta_path.exists() and not rebuild:
+        meta = json.loads(meta_path.read_text())
+        if int(meta.get("version", 0)) == DATA_VERSION:
+            log("[data] loading cached integer arrays")
+            with np.load(data_path) as z:
+                tr = {k[3:]: z[k] for k in z.files if k.startswith("tr_")}
+                ev = {k[3:]: z[k] for k in z.files if k.startswith("ev_")}
+            nu, ni, start = int(meta["nu"]), int(meta["ni"]), int(meta["start"])
+            item_vals = meta.get("items")
+            eval_df = pd.read_pickle(CACHE / "eval.pkl")
+            rowids = [x for sl in eval_df["rowids"].values for x in sl]
+            return tr, ev, nu, ni, start, rowids, item_vals
+        log(f"[data] cache version {meta.get('version')} != {DATA_VERSION}; rebuilding")
 
+    log("[data] encoding train/eval events")
+    train = pd.read_pickle(CACHE / "train.pkl")
+    evdf = pd.read_pickle(CACHE / "eval.pkl")
 
-def compute_item_ctr_recent(tr_flat, cutoff_ts, window_days=3):
-    window_start = cutoff_ts - window_days * 86400
-    recent = tr_flat[tr_flat['timestamp'] >= window_start]
-    global_ctr = float(tr_flat['label'].mean())
-    g = recent.groupby('item_id', sort=False).agg(
-        n=('label', 'size'),
-        clicks=('label', 'sum'),
-    ).reset_index()
-    alpha = 5.0
-    g['item_ctr_last_3d'] = ((g['clicks'] + alpha * global_ctr) / (g['n'] + alpha)).astype(np.float32)
-    return g[['item_id', 'item_ctr_last_3d']]
+    user_vals = pd.unique(pd.concat([train["user_id"], evdf["user_id"]],
+                                    ignore_index=True))
+    umap = {v: i for i, v in enumerate(user_vals)}
 
+    item_set = set()
+    for df in (train, evdf):
+        for row in df["items"].values:
+            item_set.update(row)
+        for row in df["history_items"].values:
+            item_set.update(row)
+    item_vals = pd.Index(sorted(item_set))
+    imap = {v: i for i, v in enumerate(item_vals)}
 
-def compute_user_stats(tr_flat):
-    global_ctr = float(tr_flat['label'].mean())
-    g = tr_flat.groupby('user_id', sort=False).agg(
-        user_n_cand=('label', 'size'),
-        user_n_events=('event_row', 'nunique'),
-        user_clicks=('label', 'sum'),
-        user_last_ts=('timestamp', 'max'),
-    ).reset_index()
-    alpha = 5.0
-    g['user_ctr']        = ((g['user_clicks'] + alpha * global_ctr) / (g['user_n_cand'] + alpha)).astype(np.float32)
-    g['user_log_events'] = np.log1p(g['user_n_events']).astype(np.float32)
-    return g[['user_id', 'user_n_events', 'user_log_events', 'user_ctr', 'user_last_ts']]
+    tr = _encode_dataframe(train, umap, imap, True)
+    ev = _encode_dataframe(evdf, umap, imap, False)
+    nu, ni = len(user_vals), len(item_vals)
+    start = int(tr["ts"].min())
 
+    # The reference pipeline processes events in CSV/timestamp order.  The pickle
+    # cache is sorted by event id, so restore chronological order for every
+    # "first event per user" statistic, warm-model fit and block assembly.
+    order = np.argsort(tr["ts"], kind="stable")
+    if not np.array_equal(order, np.arange(len(order))):
+        tr = {k: v[order] for k, v in tr.items()}
+    rowids = [x for sl in evdf["rowids"].values for x in sl]
 
-# ---------------------------------------------------------------------------
-# ALS collaborative signal
-# ---------------------------------------------------------------------------
-def train_als(tr_flat, factors=64, iterations=15, reg=0.05):
-    if not HAS_IMPLICIT:
-        print("[als] implicit not installed — skipping ALS features")
-        return None, {}, {}
-
-    clicks = tr_flat[tr_flat['label'] == 1]
-    user_ids = sorted(tr_flat['user_id'].unique())
-    item_ids = sorted(tr_flat['item_id'].unique())
-    user2row = {u: i for i, u in enumerate(user_ids)}
-    item2col = {it: i for i, it in enumerate(item_ids)}
-
-    rows = clicks['user_id'].map(user2row).values
-    cols = clicks['item_id'].map(item2col).values
-    data = np.ones(len(rows), dtype=np.float32)
-
-    R = sparse.csr_matrix((data, (rows, cols)),
-                          shape=(len(user_ids), len(item_ids)))
-    print(f"[als] matrix shape={R.shape}  nnz={R.nnz:,}")
-
-    t0 = time.time()
-    als = AlternatingLeastSquares(
-        factors=factors, iterations=iterations,
-        regularization=reg, random_state=42, use_gpu=False,
+    np.savez(
+        data_path,
+        **{f"tr_{k}": v for k, v in tr.items()},
+        **{f"ev_{k}": v for k, v in ev.items()},
     )
-    als.fit(R)
-    print(f"[als] trained in {time.time()-t0:.1f}s")
+    meta_path.write_text(json.dumps(dict(nu=nu, ni=ni, start=start,
+                                         version=DATA_VERSION,
+                                         items=list(item_vals))))
+    log(f"[data] users={nu:,} items={ni:,} train events={len(tr['ts']):,} "
+        f"eval events={len(ev['ts']):,}")
+    return tr, ev, nu, ni, start, rowids, list(item_vals)
 
-    return (als.user_factors.astype(np.float32),
-            als.item_factors.astype(np.float32)), user2row, item2col
+
+# ---------------------------------------------------------------------------
+# Statistics / factor models (all cut off strictly before `cutoff`)
+# ---------------------------------------------------------------------------
+def _clicked_events(ds, idx):
+    labels = ds["labels"][idx]
+    hit = labels.sum(axis=1) == 1
+    events = idx[hit]
+    items = ds["items"][events, labels[hit].argmax(axis=1)]
+    return events, items
 
 
-def compute_als_scores(df, als_artifacts, user2row, item2col):
-    if als_artifacts is None:
-        return np.zeros(len(df), dtype=np.float32)
-    uf, itf = als_artifacts
-    u_idx = df['user_id'].map(user2row).fillna(-1).astype(np.int64).values
-    i_idx = df['item_id'].map(item2col).fillna(-1).astype(np.int64).values
-    out = np.zeros(len(df), dtype=np.float32)
-    valid = (u_idx >= 0) & (i_idx >= 0)
-    if valid.any():
-        out[valid] = np.einsum('ij,ij->i', uf[u_idx[valid]], itf[i_idx[valid]])
+def _core_statistics(ds, nu, ni, idx):
+    y = ds["labels"][idx].ravel()
+    g = float(y.mean())
+    ue = np.repeat(ds["user"][idx], 10)
+    ie = ds["items"][idx].ravel()
+    ui = np.bincount(ue, minlength=nu).astype(np.float32)
+    uc = np.bincount(ue, weights=y, minlength=nu).astype(np.float32)
+    ii = np.bincount(ie, minlength=ni).astype(np.float32)
+    ic = np.bincount(ie, weights=y, minlength=ni).astype(np.float32)
+
+    _, first = np.unique(ds["user"][idx], return_index=True)
+    first_events = idx[first]
+    h = ds["hist"][first_events]
+    hu = np.repeat(ds["user"][first_events], 20)
+    hi = h.ravel()
+    valid = hi >= 0
+    ce, ci = _clicked_events(ds, idx)
+
+    matrix = coo_matrix(
+        (np.ones(int(valid.sum()) + len(ci), dtype=np.float32),
+         (np.concatenate([hu[valid], ds["user"][ce]]),
+          np.concatenate([hi[valid], ci]))),
+        shape=(nu, ni),
+    ).tocsr()
+    matrix.data = np.log1p(matrix.data)
+    svd = TruncatedSVD(n_components=32, n_iter=4, random_state=42)
+    svd.fit(matrix)
+    emb = svd.components_.T.copy()
+    emb /= np.maximum(np.linalg.norm(emb, axis=1, keepdims=True), 1e-8)
+    return g, ui, uc, ii, ic, emb.astype(np.float32)
+
+
+def _personalized_statistics(ds, nu, ni, idx, core):
+    _, first = np.unique(ds["user"][idx], return_index=True)
+    first_events = idx[first]
+    h = ds["hist"][first_events]
+    hu = np.repeat(ds["user"][first_events], 20)
+    hi = h.ravel()
+    valid = hi >= 0
+    ce, ci = _clicked_events(ds, idx)
+
+    rows = np.concatenate([hu[valid], ds["user"][ce]])
+    cols = np.concatenate([hi[valid], ci])
+    matrix = coo_matrix(
+        (np.ones(len(rows), dtype=np.float32), (rows, cols)), shape=(nu, ni)
+    ).tocsr()
+    matrix.data = np.log1p(matrix.data)
+    idf = np.log1p(nu / (1 + np.asarray((matrix > 0).sum(axis=0)).ravel()))
+    weighted = normalize(matrix.multiply(idf).tocsr(), norm="l2")
+    svd = TruncatedSVD(n_components=64, n_iter=5, random_state=43)
+    svd.fit(weighted)
+    emb = normalize(svd.components_.T.copy()).astype(np.float32)
+    profiles = normalize(matrix @ emb).astype(np.float32)
+    return emb, profiles
+
+
+def _build_warm_statistics(ds, nu, ni, idx, cutoff, core, emb64, profiles):
+    ce, ci = _clicked_events(ds, idx)
+
+    # history -> clicked item relation table
+    h = ds["hist"][ce]
+    left = h.ravel()
+    right = np.repeat(ci, 20)
+    mask = left >= 0
+    matrix = coo_matrix(
+        (np.ones(int(mask.sum()), dtype=np.float32),
+         (left[mask], right[mask])),
+        shape=(ni, ni),
+    ).tocsr()
+
+    # warm-up transitions from each user's first available pre-cutoff history
+    _, first = np.unique(ds["user"][idx], return_index=True)
+    histories = ds["hist"][idx[first]]
+    for j in range(1, 20):
+        previous = histories[:, :j]
+        following = histories[:, j]
+        source = previous.ravel()
+        target = np.repeat(following, j)
+        m = (source >= 0) & (target >= 0)
+        matrix += coo_matrix(
+            (np.ones(int(m.sum()), dtype=np.float32),
+             (source[m], target[m])),
+            shape=(ni, ni),
+        ).tocsr()
+
+    hc = np.asarray(matrix.sum(axis=1)).ravel().astype(np.float32)
+    cc = np.asarray(matrix.sum(axis=0)).ravel().astype(np.float32)
+    co = matrix.tocoo()
+    keys = co.row.astype(np.int64) * ni + co.col
+    order = np.argsort(keys)
+    keys = keys[order]
+    counts = co.data[order].astype(np.float32)
+    co.data /= np.sqrt((hc[co.row] + 10.0) * (cc[co.col] + 10.0))
+    svd = TruncatedSVD(n_components=64, n_iter=5, random_state=44)
+    us = svd.fit_transform(co.tocsr())
+    s = np.maximum(svd.singular_values_, 1e-8)
+    src = (us / np.sqrt(s)).astype(np.float32)
+    dst = (svd.components_.T * np.sqrt(s)).astype(np.float32)
+
+    # contextual exposure/click summaries
+    y = ds["labels"][idx].ravel()
+    g = float(y.mean())
+    bucket = np.repeat(ds["tb"][idx], 10)
+    bucket_impr = np.bincount(bucket, minlength=4)
+    bucket_click = np.bincount(bucket, weights=y, minlength=4)
+    context = {
+        "global": g,
+        "bucket_ctr": ((bucket_click + 100.0 * g) / (bucket_impr + 100.0)).astype(np.float32),
+    }
+    users_flat = np.repeat(ds["user"][idx], 10)
+    items_flat = ds["items"][idx].ravel()
+    recent_rows = np.repeat(ds["ts"][idx], 10) >= (cutoff - DAY)
+    for name, ids, size in (("user", users_flat, nu), ("item", items_flat, ni)):
+        key = ids * 4 + bucket
+        context[name + "_impr"] = np.bincount(ids, minlength=size)
+        context[name + "_click"] = np.bincount(ids, weights=y, minlength=size)
+        context[name + "_bucket_impr"] = np.bincount(key, minlength=size * 4)
+        context[name + "_bucket_click"] = np.bincount(key, weights=y, minlength=size * 4)
+        context[name + "_recent_impr"] = np.bincount(ids[recent_rows], minlength=size)
+        context[name + "_recent_click"] = np.bincount(
+            ids[recent_rows], weights=y[recent_rows], minlength=size
+        )
+
+    relations = ((core, emb64, profiles), keys, counts, hc, cc, src, dst)
+    return relations, context
+
+
+def _preference_statistics(ds, nu, ni, idx, cutoff):
+    core = _core_statistics(ds, nu, ni, idx)
+    emb64, profiles = _personalized_statistics(ds, nu, ni, idx, core)
+    relations, context = _build_warm_statistics(
+        ds, nu, ni, idx, cutoff, core, emb64, profiles
+    )
+
+    _, keys, counts, hc, cc, _, _ = relations
+    row = keys // ni
+    col = keys % ni
+    matrix = coo_matrix(
+        (counts / np.sqrt((hc[row] + 10.0) * (cc[col] + 10.0)), (row, col)),
+        shape=(ni, ni),
+    ).tocsr()
+    svd = TruncatedSVD(n_components=128, n_iter=5, random_state=46)
+    us = svd.fit_transform(matrix)
+    s = np.maximum(svd.singular_values_, 1e-8)
+    left = (us / np.sqrt(s)).astype(np.float32)
+    right = (svd.components_.T * np.sqrt(s)).astype(np.float32)
+    taste = normalize(right[:, 1:]).astype(np.float32)
+
+    _, first = np.unique(ds["user"][idx], return_index=True)
+    first_events = idx[first]
+    h = ds["hist"][first_events]
+    hu = np.repeat(ds["user"][first_events], 20)
+    hi = h.ravel()
+    valid = hi >= 0
+    ce, ci = _clicked_events(ds, idx)
+
+    users = np.concatenate([hu[valid], ds["user"][ce]])
+    items = np.concatenate([hi[valid], ci])
+    positive = coo_matrix(
+        (np.ones(len(users), dtype=np.float32), (users, items)), shape=(nu, ni)
+    ).tocsr()
+    exposure = coo_matrix(
+        (np.ones(len(idx) * 10, dtype=np.float32),
+         (np.repeat(ds["user"][idx], 10), ds["items"][idx].ravel())),
+        shape=(nu, ni),
+    ).tocsr()
+    pc = np.asarray(positive.sum(axis=1)).ravel()
+    ec = np.asarray(exposure.sum(axis=1)).ravel()
+    pm = (positive @ taste) / np.maximum(pc[:, None], 1)
+    em = (exposure @ taste) / np.maximum(ec[:, None], 1)
+    profile = normalize(pm).astype(np.float32)
+    contrast = normalize(pm - em).astype(np.float32)
+    variance = np.maximum(np.mean(taste * taste, axis=0), 1e-6)
+    adjusted = normalize((pm - em) / np.sqrt(variance)).astype(np.float32)
+    return ((relations, context), left, right, taste, profile,
+            contrast, adjusted, pc.astype(np.float32))
+
+
+def get_preference(ds, nu, ni, cutoff):
+    path = FEAT / f"pref_{cutoff}.pkl"
+    if path.exists():
+        with path.open("rb") as f:
+            return pickle.load(f)
+    log(f"[stats] preference features cutoff={cutoff} "
+        f"({pd.to_datetime(cutoff, unit='s')})")
+    idx = np.flatnonzero(ds["ts"] < cutoff)
+    t = time.time()
+    result = _preference_statistics(ds, nu, ni, idx, cutoff)
+    with path.open("wb") as f:
+        pickle.dump(result, f, protocol=5)
+    log(f"[stats] done in {time.time() - t:.1f}s")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Warm-16 joint choice model
+# ---------------------------------------------------------------------------
+@njit
+def _warm_epoch(order, users, positive, negatives, U, V, au, av,
+                lr, reg, weight, pop_bias):
+    d = U.shape[1]
+    loss = 0.0
+    for q in order:
+        u = users[q]
+        items = negatives[q].copy()
+        items[0] = positive[q]
+        z = U[u].copy()
+        logits = np.empty(len(items))
+        maximum = -1e30
+        for j in range(len(items)):
+            v = pop_bias[items[j]]
+            for k in range(d):
+                v += z[k] * V[items[j], k]
+            logits[j] = max(-25.0, min(25.0, v))
+            maximum = max(maximum, logits[j])
+        p = np.exp(logits - maximum)
+        denom = p.sum()
+        loss += math.log(denom) + maximum - logits[0]
+        grad = np.zeros(d, np.float32)
+        for j in range(len(items)):
+            i = items[j]
+            err = weight * (p[j] / denom - (1.0 if j == 0 else 0.0))
+            for k in range(d):
+                grad[k] += err * V[i, k]
+                g = err * z[k] + weight * reg * V[i, k]
+                av[i, k] += g * g
+                V[i, k] -= lr * g / math.sqrt(av[i, k])
+        for k in range(d):
+            g = grad[k] + weight * reg * U[u, k]
+            au[u, k] += g * g
+            U[u, k] -= lr * g / math.sqrt(au[u, k])
+    return loss / max(len(order), 1)
+
+
+@njit
+def _choice_epoch(order, users, items, history, target,
+                  U, V, H, bu, bi, au, av, ah, abu, abi, lr, reg):
+    d = U.shape[1]
+    total = 0.0
+    for e in order:
+        u = users[e]
+        z = U[u].copy()
+        n = 0
+        for q in range(20):
+            if history[e, q] >= 0:
+                n += 1
+        scale = 1.0 / math.sqrt(max(n, 1))
+        for q in range(n):
+            h = history[e, q]
+            for k in range(d):
+                z[k] += scale * H[h, k]
+
+        logits = np.empty(10)
+        maximum = 0.0
+        for j in range(10):
+            item = items[e, j]
+            value = -1.8 + bu[u] + bi[item]
+            for k in range(d):
+                value += z[k] * V[item, k]
+            logits[j] = max(-30.0, min(30.0, value))
+            maximum = max(maximum, logits[j])
+
+        p = np.empty(10)
+        denom = math.exp(-maximum)
+        for j in range(10):
+            p[j] = math.exp(logits[j] - maximum)
+            denom += p[j]
+        total += math.log(denom) + maximum - (
+            logits[target[e]] if target[e] < 10 else 0.0
+        )
+
+        gradient = np.zeros(d, dtype=np.float32)
+        biasgrad = 0.0
+        for j in range(10):
+            item = items[e, j]
+            error = p[j] / denom - (1.0 if target[e] == j else 0.0)
+            biasgrad += error
+            for k in range(d):
+                gradient[k] += error * V[item, k]
+                g = error * z[k] + reg * V[item, k]
+                av[item, k] += g * g
+                V[item, k] -= lr * g / math.sqrt(av[item, k])
+            g = error + reg * bi[item]
+            abi[item] += g * g
+            bi[item] -= lr * g / math.sqrt(abi[item])
+        for k in range(d):
+            g = gradient[k] + reg * U[u, k]
+            au[u, k] += g * g
+            U[u, k] -= lr * g / math.sqrt(au[u, k])
+        g = biasgrad + reg * bu[u]
+        abu[u] += g * g
+        bu[u] -= lr * g / math.sqrt(abu[u])
+
+        for q in range(n):
+            h = history[e, q]
+            for k in range(d):
+                g = scale * gradient[k] + reg * H[h, k]
+                ah[h, k] += g * g
+                H[h, k] -= lr * g / math.sqrt(ah[h, k])
+    return total / len(order)
+
+
+@njit
+def _predict_events(users, items, history, U, V, H, bu, bi):
+    out = np.empty((len(users), 10), dtype=np.float64)
+    d = U.shape[1]
+    for e in range(len(users)):
+        u = users[e]
+        z = U[u].copy()
+        n = 0
+        for q in range(20):
+            if history[e, q] >= 0:
+                n += 1
+        scale = 1.0 / math.sqrt(max(n, 1))
+        for q in range(n):
+            h = history[e, q]
+            for k in range(d):
+                z[k] += scale * H[h, k]
+        logits = np.empty(10)
+        maximum = 0.0
+        for j in range(10):
+            item = items[e, j]
+            value = -1.8 + bu[u] + bi[item]
+            for k in range(d):
+                value += z[k] * V[item, k]
+            logits[j] = max(-30.0, min(30.0, value))
+            maximum = max(maximum, logits[j])
+        denom = math.exp(-maximum)
+        for j in range(10):
+            out[e, j] = math.exp(logits[j] - maximum)
+            denom += out[e, j]
+        for j in range(10):
+            out[e, j] /= denom
     return out
 
 
+def _warm_history(idx, ds):
+    _, first = np.unique(ds["user"][idx], return_index=True)
+    events = idx[first]
+    h = ds["hist"][events]
+    users = np.repeat(ds["user"][events], 20)
+    items = h.ravel()
+    keep = items >= 0
+    stamps = ds["hts"][events].ravel()
+    keys = np.rec.fromarrays(
+        [users[keep], items[keep], stamps[keep]],
+        names="user,item,timestamp",
+    )
+    _, unique = np.unique(keys, return_index=True)
+    return users[keep][unique].astype(np.int32), items[keep][unique].astype(np.int32)
+
+
+def _event_targets(ds, idx):
+    y = ds["labels"][idx]
+    return np.where(y.sum(axis=1) > 0, y.argmax(axis=1), 10).astype(np.int32)
+
+
+def _init_warm_params(ds, nu, ni, init_cut, dim=16):
+    s = get_preference(ds, nu, ni, init_cut)
+    context = s[0][1]
+    V = normalize(s[3][:, :dim]).astype(np.float32)
+    U = (0.25 * normalize(s[4][:, :dim])).astype(np.float32)
+    H = (0.25 * V.copy()).astype(np.float32)
+    g = context["global"]
+    ur = (context["user_click"] + 50.0 * g) / (context["user_impr"] + 50.0)
+    ir = (context["item_click"] + 50.0 * g) / (context["item_impr"] + 50.0)
+    t = np.clip(ur * 10.0, 0.02, 0.98)
+    bu = np.clip(np.log(t / (1.0 - t) / 10.0) + 1.8, -2, 2).astype(np.float32)
+    bi = np.clip(np.log(ir / g), -2, 2).astype(np.float32)
+    return [U, V, H, bu, bi]
+
+
+def get_warm_model(ds, nu, ni, start, cutoff, dim=16, epochs=10):
+    path = FEAT / f"warm16_{cutoff}.npz"
+    if path.exists():
+        with np.load(path) as z:
+            return [z[k] for k in ("U", "V", "H", "bu", "bi")]
+    day = (cutoff - start) // DAY
+    init_cut = start + max(int(day) - 2, 2) * DAY
+    log(f"[warm] fitting cutoff={cutoff} init={init_cut} dim={dim} epochs={epochs}")
+    t = time.time()
+    idx = np.flatnonzero(ds["ts"] < cutoff)
+    params = _init_warm_params(ds, nu, ni, init_cut, dim)
+    acc = [np.full_like(p, 0.1) for p in params]
+
+    wu, wi = _warm_history(idx, ds)
+    counts = np.bincount(wi, minlength=ni) + 1
+    pop_bias = np.log(counts / counts.mean()).astype(np.float32)
+    users = ds["user"][idx]
+    items = ds["items"][idx]
+    history = ds["hist"][idx]
+    target = _event_targets(ds, idx)
+    rng = np.random.default_rng(151)
+
+    for epoch in range(1, epochs + 1):
+        negatives = rng.integers(0, ni, size=(len(wu), 11), dtype=np.int32)
+        collision = negatives == wi[:, None]
+        while collision.any():
+            negatives[collision] = rng.integers(
+                0, ni, size=int(collision.sum()), dtype=np.int32
+            )
+            collision = negatives == wi[:, None]
+        _warm_epoch(rng.permutation(len(wu)), wu, wi, negatives,
+                    params[0], params[1], acc[0], acc[1],
+                    0.045, 0.002, 1.0, pop_bias)
+        loss = _choice_epoch(rng.permutation(len(users)), users, items, history,
+                             target, *params, *acc, 0.045, 0.002)
+        if epoch in (1, 5, 10):
+            log(f"[warm] epoch={epoch} loss={loss:.5f} elapsed={time.time() - t:.0f}s")
+    np.savez_compressed(path, U=params[0], V=params[1], H=params[2],
+                        bu=params[3], bi=params[4])
+    log(f"[warm] done in {time.time() - t:.0f}s")
+    return params
+
+
 # ---------------------------------------------------------------------------
-# Feature assembly
+# ALS exposure model
 # ---------------------------------------------------------------------------
-def add_item2vec_features(flat, events):
-    with open(CACHE / "item2vec.pkl", "rb") as f:
-        item2vec = pickle.load(f)
-    if not item2vec:
-        raise ValueError("Item2Vec cache contains no embeddings")
-    item2idx = {item: i for i, item in enumerate(item2vec)}
-    emb_matrix = np.stack(list(item2vec.values())).astype(np.float32)
-    if emb_matrix.ndim != 2 or emb_matrix.shape[1] != 64 or not np.isfinite(emb_matrix).all():
-        raise ValueError("Item2Vec embeddings must be finite 64-dimensional vectors")
-    norms = np.linalg.norm(emb_matrix, axis=1, keepdims=True)
-    emb_matrix /= np.maximum(norms, 1e-8)
-
-    max_hist = max(events['history_items'].map(len), default=0)
-    hist_idx = np.full((len(events), max_hist), -1, dtype=np.int32)
-    for event_row, history in enumerate(events['history_items']):
-        hist_idx[event_row, :len(history)] = [item2idx.get(item, -1) for item in history]
-    cand_idx = flat['item_id'].map(item2idx).fillna(-1).to_numpy(dtype=np.int32)
-    event_rows = flat['event_row'].to_numpy(dtype=np.int64)
-    result = np.zeros((len(flat), 3), dtype=np.float32)
-
-    # Bound embedding gathers instead of materializing the full candidate-history join.
-    if max_hist:
-        positions = np.arange(max_hist)[None, :]
-        for start in range(0, len(flat), 4096):
-            stop = min(start + 4096, len(flat))
-            candidates = cand_idx[start:stop]
-            histories = hist_idx[event_rows[start:stop]]
-            valid = (candidates[:, None] >= 0) & (histories >= 0)
-            sims = np.einsum('bd,bhd->bh',
-                             emb_matrix[np.maximum(candidates, 0)],
-                             emb_matrix[np.maximum(histories, 0)])
-            counts = valid.sum(axis=1)
-            result[start:stop, 0] = np.where(
-                counts > 0, np.where(valid, sims, -np.inf).max(axis=1), 0.0)
-            result[start:stop, 1] = np.where(valid, sims, 0.0).sum(axis=1) / np.maximum(counts, 1)
-            last_pos = np.where(valid, positions, -1).max(axis=1)
-            result[start:stop, 2] = np.where(
-                counts > 0, sims[np.arange(stop - start), np.maximum(last_pos, 0)], 0.0)
-    flat[['item2vec_sim_max', 'item2vec_sim_mean', 'item2vec_sim_last']] = result
-    # Dot(candidate, mean(history)) equals the mean candidate-history similarity.
-    flat['item2vec_sim_user_profile'] = result[:, 1]
-    emb_cols = [f'item2vec_dim_{i}' for i in range(64)]
-    padded_embeddings = np.concatenate([emb_matrix, np.zeros((1, 64), dtype=np.float32)])
-    candidate_embeddings = padded_embeddings[np.where(cand_idx >= 0, cand_idx, len(item2idx))]
-    flat = pd.concat([flat, pd.DataFrame(candidate_embeddings, columns=emb_cols,
-                                        index=flat.index)], axis=1)
-    return flat
+@njit(parallel=True)
+def _solve_rows(indptr, indices, weights, targets, factors, other_bias,
+                gram, rhs, background, global_rate, prior_bias,
+                latent_reg=1.0, bias_reg=20.0):
+    n = len(indptr) - 1
+    d = factors.shape[1]
+    bias = np.empty(n, np.float64)
+    latent = np.empty((n, d), np.float64)
+    for row in prange(n):
+        a = background[row] * gram.copy()
+        b = background[row] * rhs.copy()
+        a[0, 0] += bias_reg
+        b[0] += bias_reg * prior_bias[row]
+        for j in range(1, d + 1):
+            a[j, j] += latent_reg
+        vector = np.empty(d + 1, np.float64)
+        vector[0] = 1.0
+        for q in range(indptr[row], indptr[row + 1]):
+            item = indices[q]
+            weight = weights[q]
+            for j in range(d):
+                vector[j + 1] = factors[item, j]
+            residual = targets[q] - weight * (global_rate + other_bias[item])
+            for j in range(d + 1):
+                b[j] += residual * vector[j]
+                for k in range(d + 1):
+                    a[j, k] += weight * vector[j] * vector[k]
+        value = np.linalg.solve(a, b)
+        bias[row] = value[0]
+        latent[row] = value[1:]
+    return bias, latent
 
 
-def add_features(flat, events, item_stats, item_recent, user_stats,
-                 als_artifacts, user2row, item2col, global_ctr, cutoff_ts):
-    t0 = time.time()
+def _augmented(factors):
+    return np.column_stack([np.ones(len(factors)), factors])
 
-    # --- Item stats ---
-    flat = flat.merge(item_stats, on='item_id', how='left')
-    flat = flat.merge(item_recent, on='item_id', how='left')
-    flat['item_ctr']         = flat['item_ctr'].fillna(global_ctr).astype(np.float32)
-    flat['item_log_n']       = flat['item_log_n'].fillna(0).astype(np.float32)
-    flat['item_click_count'] = flat['item_click_count'].fillna(0).astype(np.float32)
-    flat['item_ctr_last_3d'] = flat['item_ctr_last_3d'].fillna(global_ctr).astype(np.float32)
-    gap_days = (flat['timestamp'] - flat['last_ts']).clip(lower=0) / 86400.0
-    flat['item_days_since_last_seen'] = np.log1p(gap_days).astype(np.float32).fillna(0.0)
-    flat = flat.drop(columns=['last_ts'])
 
-    # --- User stats ---
-    flat = flat.merge(user_stats, on='user_id', how='left')
-    flat['user_n_events']  = flat['user_n_events'].fillna(0).astype(np.float32)
-    flat['user_log_events']= flat['user_log_events'].fillna(0).astype(np.float32)
-    flat['user_ctr']       = flat['user_ctr'].fillna(global_ctr).astype(np.float32)
-    gap_days = (flat['timestamp'] - flat['user_last_ts']).clip(lower=0) / 86400.0
-    flat['user_last_active_gap_days'] = np.log1p(gap_days).astype(np.float32).fillna(0.0)
-    flat = flat.drop(columns=['user_last_ts'])
+def _paired_matrices(users, items, weights, positives, shape):
+    w = coo_matrix((weights, (users, items)), shape=shape).tocsr()
+    t = coo_matrix((positives, (users, items)), shape=shape).tocsr()
+    assert np.array_equal(w.indptr, t.indptr)
+    assert np.array_equal(w.indices, t.indices)
+    return w, t
 
-    # --- History interaction ---
-    ev_hist = events[['history_items', 'history_timestamps']].copy().reset_index(drop=True)
-    ev_hist['event_row'] = ev_hist.index.astype(np.int64)
-    ev_hist['hist_pos']   = ev_hist['history_items'].apply(lambda x: list(range(len(x))))
-    ev_hist['hist_len']   = ev_hist['history_items'].apply(len).astype(np.float32)
-    ev_hist['hist_uniq']  = ev_hist['history_items'].apply(lambda x: len(set(x))).astype(np.float32)
 
-    hist_long = ev_hist[['event_row', 'history_items', 'history_timestamps', 'hist_pos']].explode(
-        ['history_items', 'history_timestamps', 'hist_pos']
-    ).rename(columns={
-        'history_items':      'item_id',
-        'history_timestamps': 'hist_ts',
-    })
-    hist_long = hist_long.dropna(subset=['item_id']).copy()
-    hist_long['hist_pos'] = hist_long['hist_pos'].astype(np.int16)
+def _als_prepare(ds, nu, ni, cutoff):
+    idx = np.flatnonzero(ds["ts"] < cutoff)
+    wu, wi = _warm_history(idx, ds)
+    g = float(ds["labels"][idx].ravel().mean())
+    ue = np.bincount(np.repeat(ds["user"][idx], 10), minlength=nu)
+    ie = np.bincount(ds["items"][idx].ravel(), minlength=ni)
+    uc = np.bincount(np.repeat(ds["user"][idx], 10),
+                     weights=ds["labels"][idx].ravel(), minlength=nu)
+    ic = np.bincount(ds["items"][idx].ravel(),
+                     weights=ds["labels"][idx].ravel(), minlength=ni)
+    up = (uc + 50.0 * g) / (ue + 50.0) - g
+    ip = (ic + 50.0 * g) / (ie + 50.0) - g
+    warm_count = np.bincount(wu, minlength=nu)
+    confidence = 9.0 * warm_count / ni
 
-    hist_agg = hist_long.groupby(['event_row', 'item_id'], sort=False).agg(
-        hist_count=('hist_pos', 'size'),
-        hist_last_ts=('hist_ts', 'max'),
-        hist_last_pos=('hist_pos', 'max'),
-    ).reset_index()
+    users = np.concatenate([np.repeat(ds["user"][idx], 10), wu])
+    items = np.concatenate([ds["items"][idx].ravel(), wi])
+    weights = np.ones(len(users), dtype=np.float32)
+    positives = np.concatenate([
+        ds["labels"][idx].ravel().astype(np.float32),
+        np.ones(len(wu), dtype=np.float32),
+    ])
+    w, t = _paired_matrices(users, items, weights, positives, (nu, ni))
+    wt, tt = w.T.tocsr(), t.T.tocsr()
+    assert np.array_equal(wt.indptr, tt.indptr)
+    assert np.array_equal(wt.indices, tt.indices)
+    return w, t, wt, tt, g, up, ip, confidence, ue.astype(np.float64), ie
 
-    flat = flat.merge(hist_agg, on=['event_row', 'item_id'], how='left')
-    flat = add_item2vec_features(flat, events)
-    flat['in_history']    = flat['hist_count'].notna().astype(np.int8)
-    flat['hist_count']    = flat['hist_count'].fillna(0).astype(np.int8)
-    flat['hist_last_pos'] = flat['hist_last_pos'].fillna(-1).astype(np.int16)
-    gap_vals = flat['timestamp'].astype(float) - flat['hist_last_ts'].astype(float)
-    gap_vals = gap_vals.fillna(-1.0).clip(lower=-1.0) / 86400.0
-    flat['hist_gap_days'] = gap_vals.astype(np.float32)
-    flat = flat.drop(columns=['hist_last_ts'])
 
-    # --- Event-level history summary ---
-    ev_summary = ev_hist[['event_row', 'hist_len', 'hist_uniq']].set_index('event_row')
-    flat['hist_len']          = flat['event_row'].map(ev_summary['hist_len']).astype(np.float32)
-    flat['hist_unique_ratio'] = (
-        flat['event_row'].map(ev_summary['hist_uniq']) / flat['hist_len'].clip(lower=1)
+def get_als_model(ds, nu, ni, start, cutoff):
+    path = FEAT / f"als_{cutoff}.npz"
+    if path.exists():
+        with np.load(path) as z:
+            return {k: z[k] for k in z.files}
+    log(f"[als] fitting cutoff={cutoff} ({pd.to_datetime(cutoff, unit='s')})")
+    t = time.time()
+    w, tr, wt, tt, g, up, ip, confidence, exposures, item_exposures = _als_prepare(
+        ds, nu, ni, cutoff
+    )
+    warm = get_warm_model(ds, nu, ni, start, cutoff)
+    V = warm[1].astype(np.float64)
+    V /= np.maximum(np.linalg.norm(V, axis=1, keepdims=True), 1e-12)
+    U = np.zeros((nu, 16))
+    bu = up.copy()
+    bi = ip.copy()
+    for iteration in range(6):
+        x = _augmented(V)
+        bu, U = _solve_rows(
+            w.indptr, w.indices, w.data, tr.data, V, bi,
+            x.T @ x, -x.T @ (g + bi), confidence, g, up,
+        )
+        x = _augmented(U)
+        bi, V = _solve_rows(
+            wt.indptr, wt.indices, wt.data, tt.data, U, bu,
+            x.T @ (confidence[:, None] * x),
+            -x.T @ (confidence * (g + bu)),
+            np.ones(ni), g, ip,
+        )
+    np.savez_compressed(
+        path, U=U, V=V, bu=bu, bi=bi, g=g, exposures=exposures,
+        item_exposures=item_exposures, cutoff=cutoff, iteration=6,
+    )
+    log(f"[als] done in {time.time() - t:.1f}s")
+    return dict(U=U, V=V, bu=bu, bi=bi, g=g, exposures=exposures,
+                item_exposures=item_exposures)
+
+
+def _als_score(ds, events, model, nu, ni):
+    """Return user factor and user bias for each event, folding in cold users."""
+    U = model["U"]
+    V = model["V"]
+    bi = model["bi"]
+    g = float(model["g"])
+    exposures = model["exposures"]
+    users = ds["user"][events]
+    u = U[users].copy()
+    bias = model["bu"][users].copy()
+    cold = exposures[users] == 0
+    if cold.any():
+        selected = events[cold]
+        h = ds["hist"][selected]
+        stamps = ds["hts"][selected]
+        valid = h >= 0
+        local = np.repeat(np.arange(len(h)), 20)[valid.ravel()]
+        target_items = h.ravel()[valid.ravel()]
+        target_stamps = stamps.ravel()[valid.ravel()]
+        keys = np.rec.fromarrays([local, target_items, target_stamps],
+                                names="row,item,timestamp")
+        _, keep = np.unique(keys, return_index=True)
+        local = local[keep]
+        target_items = target_items[keep]
+        values = np.ones(len(local), dtype=np.float32)
+        w, t = _paired_matrices(local, target_items, values, values,
+                                (len(h), ni))
+        x = _augmented(V)
+        count = np.bincount(local, minlength=len(h))
+        cb, cu = _solve_rows(
+            w.indptr, w.indices, w.data, t.data, V, bi,
+            x.T @ x, -x.T @ (g + bi), 9.0 * count / ni, g,
+            np.zeros(len(h)),
+        )
+        u[cold] = cu
+        bias[cold] = cb
+    return u, bias
+
+
+# ---------------------------------------------------------------------------
+# Feature builders
+# ---------------------------------------------------------------------------
+def _feature_core(ds, events, extra_stats):
+    """13 core + 12 extra + 27 relative features from core/core_v2."""
+    g, ui, uc, ii, ic, emb = extra_stats[0]
+    emb64, profiles = extra_stats[1], extra_stats[2]
+    n = len(events)
+    items = ds["items"][events]
+    users = ds["user"][events]
+    h = ds["hist"][events]
+    valid = h >= 0
+    safe = np.maximum(h, 0)
+    length = valid.sum(axis=1)
+
+    v = emb[safe] * valid[:, :, None]
+    avg = v.sum(axis=1) / np.maximum(length[:, None], 1)
+    sim = np.einsum("nhd,ncd->nch", v, emb[items])
+    positions = np.arange(1, 21)[None, :]
+
+    cols = [
+        ((uc[users] + 50.0 * g) / (ui[users] + 50.0))[:, None].repeat(10, 1),
+        (ic[items] + 50.0 * g) / (ii[items] + 50.0),
+        np.log1p(ui[users])[:, None].repeat(10, 1),
+        np.log1p(ii[items]),
+        np.broadcast_to(ds["tb"][events][:, None], (n, 10)),
+        np.broadcast_to(ds["dt"][events][:, None], (n, 10)),
+        np.broadcast_to(length[:, None], (n, 10)),
+        (h[:, None, :] == items[:, :, None]).sum(axis=2),
+        (avg[:, None, :] * emb[items]).sum(axis=2),
+        sim.max(axis=2),
+        (sim * positions).sum(axis=2) / np.maximum(
+            (valid * positions).sum(axis=1), 1
+        )[:, None],
+        ((((ic[safe] + 50.0 * g) / (ii[safe] + 50.0)) * valid).sum(axis=1)
+         / np.maximum(length, 1))[:, None].repeat(10, 1),
+        np.broadcast_to(((ds["ts"][events] % 86400) / 86400.0)[:, None], (n, 10)),
+    ]
+    x = np.stack(cols, axis=2)
+
+    age = length[:, None] - 1 - np.arange(20)[None, :]
+    vals = []
+    for width in (1, 3, 5, 10):
+        mask = valid[:, None, :] & (age[:, None, :] < width)
+        vals.append((sim * mask).sum(axis=2) / np.maximum(mask.sum(axis=2), 1))
+    for decay in (0.5, 0.85):
+        w = np.power(decay, np.maximum(age, 0)) * valid
+        vals.append((sim * w[:, None, :]).sum(axis=2)
+                    / np.maximum(w.sum(axis=1), 1e-9)[:, None])
+    vals.extend([
+        sim.sum(axis=2) / np.maximum(length, 1)[:, None],
+        sim.max(axis=2),
+        np.sqrt((sim ** 2).sum(axis=2) / np.maximum(length, 1)[:, None]),
+        (profiles[users][:, None, :] * emb64[items]).sum(axis=2),
+        ((h[:, None, :] == items[:, :, None])
+         & (age[:, None, :] < 3)).sum(axis=2),
+        np.where(valid[:, None, :], sim, -2).argmax(axis=2)
+        / np.maximum(length, 1)[:, None],
+    ])
+    x = np.concatenate([x, np.stack(vals, axis=2)], axis=2)
+
+    rel = []
+    for col in (1, 8, 9, 13, 14, 15, 19, 20, 22):
+        vv = x[:, :, col]
+        rel.extend([
+            vv - vv.mean(axis=1, keepdims=True),
+            vv - vv.max(axis=1, keepdims=True),
+            np.argsort(np.argsort(vv, axis=1), axis=1) / 9.0,
+        ])
+    x = np.concatenate([x] + [r[:, :, None] for r in rel], axis=2)
+    return x.reshape(-1, x.shape[2])
+
+
+def _feature_relations(ds, events, relations):
+    extra_stats, keys, counts, hc, cc, src, dst = relations
+    n = len(events)
+    items = ds["items"][events]
+    h = ds["hist"][events]
+    valid = h >= 0
+    safe = np.maximum(h, 0)
+    length = valid.sum(axis=1)
+    x = _feature_core(ds, events, extra_stats)
+
+    query = safe[:, None, :].astype(np.int64) * (cc.shape[0]) + items[:, :, None]
+    pos = np.searchsorted(keys, query)
+    inside = pos < len(keys)
+    pos = np.minimum(pos, len(keys) - 1)
+    c = np.where(
+        inside & (keys[pos] == query) & valid[:, None, :], counts[pos], 0.0
+    ).astype(np.float32)
+    hc_h = hc[safe][:, None, :]
+    cc_i = cc[items][:, :, None]
+    cosine = c / np.sqrt((hc_h + 10.0) * (cc_i + 10.0))
+    lift = c / (c + 3.0) * np.log1p(
+        c * counts.sum() / ((hc_h + 10.0) * (cc_i + 10.0))
+    )
+    latent = np.einsum("nhd,ncd->nch", src[safe], dst[items]) * valid[:, None, :]
+
+    age = length[:, None] - 1 - np.arange(20)[None, :]
+    vals = []
+    for values in (cosine, lift, latent):
+        vals.extend([
+            values.sum(axis=2) / np.maximum(length[:, None], 1),
+            values.max(axis=2),
+        ])
+        for recent in (1, 3, 5):
+            mask = valid[:, None, :] & (age[:, None, :] < recent)
+            vals.append((values * mask).sum(axis=2)
+                        / np.maximum(mask.sum(axis=2), 1))
+    vals.extend([
+        (c > 0).sum(axis=2),
+        np.log1p(c.sum(axis=2)),
+        np.log1p(c.max(axis=2)),
+    ])
+    extra = np.stack(vals, axis=2)
+    rel = []
+    for col in (0, 1, 5, 6, 10, 11):
+        vv = extra[:, :, col]
+        rel.extend([vv - vv.mean(axis=1, keepdims=True),
+                    vv - vv.max(axis=1, keepdims=True)])
+    return np.concatenate(
+        [x, extra.reshape(-1, 18)] + [r.reshape(-1, 1) for r in rel], axis=1
+    )
+
+
+def _feature_context(ds, events, base):
+    relations, context = base
+    n = len(events)
+    items = ds["items"][events]
+    b = ds["tb"][events]
+    users = ds["user"][events]
+    g = context["global"]
+    x = _feature_relations(ds, events, relations)
+
+    cols = []
+    for name, ids in (("user", users[:, None].repeat(10, 1)),
+                      ("item", items)):
+        key = ids * 4 + b[:, None]
+        exposure = context[name + "_impr"][ids]
+        clicks = context[name + "_click"][ids]
+        prior = (clicks + 50.0 * g) / (exposure + 50.0)
+        conditional = np.clip(
+            prior * context["bucket_ctr"][b][:, None] / g, 1e-5, 0.999
+        )
+        ni_ = context[name + "_bucket_impr"][key]
+        nc = context[name + "_bucket_click"][key]
+        ri = context[name + "_recent_impr"][ids]
+        rc = context[name + "_recent_click"][ids]
+        cols.extend([
+            (clicks + 10.0 * g) / (exposure + 10.0),
+            (clicks + 150.0 * g) / (exposure + 150.0),
+            (nc + 20.0 * conditional) / (ni_ + 20.0),
+            (nc + 80.0 * conditional) / (ni_ + 80.0),
+            np.log1p(ni_),
+            (rc + 30.0 * prior) / (ri + 30.0),
+            (rc + 30.0 * prior) / (ri + 30.0) - prior,
+            ni_ / np.maximum(exposure, 1),
+        ])
+    cols.append(np.broadcast_to(context["bucket_ctr"][b][:, None], (n, 10)))
+    extra = np.stack(cols, axis=2)
+
+    rel = []
+    for col in (8, 10, 11, 13, 14):
+        vv = extra[:, :, col]
+        rel.extend([vv - vv.mean(axis=1, keepdims=True),
+                    vv - vv.max(axis=1, keepdims=True)])
+    return np.concatenate(
+        [x, extra.reshape(-1, 17)] + [r.reshape(-1, 1) for r in rel], axis=1
+    )
+
+
+def _feature_preference(ds, events, stats):
+    base = stats[0]
+    left, right, taste, profile, contrast, adjusted, pc = stats[1:]
+    n = len(events)
+    items = ds["items"][events]
+    users = ds["user"][events]
+    h = ds["hist"][events]
+    valid = h >= 0
+    safe = np.maximum(h, 0)
+    length = valid.sum(axis=1)
+    age = length[:, None] - 1 - np.arange(20)[None, :]
+
+    x = _feature_context(ds, events, base)
+    l = left[safe]
+    r = right[items]
+    vals = []
+    for rank in (8, 16, 32, 64, 128):
+        ls = l[:, :, 1:rank]
+        rs = r[:, :, 1:rank]
+        raw = np.einsum("nhd,ncd->nch", ls, rs) * valid[:, None, :]
+        sim = raw / np.maximum(
+            np.linalg.norm(ls, axis=2)[:, None, :]
+            * np.linalg.norm(rs, axis=2)[:, :, None], 1e-8
+        )
+        vals.extend([
+            raw.sum(axis=2) / np.maximum(length[:, None], 1),
+            sim.sum(axis=2) / np.maximum(length[:, None], 1),
+            sim.max(axis=2),
+        ])
+        for recent in (3, 5):
+            mask = valid[:, None, :] & (age[:, None, :] < recent)
+            vals.append((sim * mask).sum(axis=2)
+                        / np.maximum(mask.sum(axis=2), 1))
+
+    t = taste[items]
+    p = profile[users]
+    c = contrast[users]
+    ad = adjusted[users]
+    vals.extend([
+        (p[:, None, :] * t).sum(axis=2),
+        (c[:, None, :] * t).sum(axis=2),
+        (ad[:, None, :] * t).sum(axis=2),
+        np.log1p(pc[users])[:, None].repeat(10, 1),
+    ])
+    ht = (taste[safe] * valid[:, :, None]).sum(axis=1) / np.maximum(
+        length[:, None], 1
+    )
+    ht = ht / np.maximum(np.linalg.norm(ht, axis=1, keepdims=True), 1e-8)
+    vals.extend([
+        (ht[:, None, :] * t).sum(axis=2),
+        (ht * p).sum(axis=1)[:, None].repeat(10, 1),
+    ])
+    extra = np.stack(vals, axis=2)
+    extra = np.concatenate([
+        extra,
+        p[:, None, :16] * t[:, :, :16],
+        ht[:, None, :16] * t[:, :, :16],
+    ], axis=2)
+
+    rel = []
+    for col in (1, 6, 11, 16, 21, 25, 26, 27, 29):
+        vv = extra[:, :, col]
+        rel.extend([vv - vv.mean(axis=1, keepdims=True),
+                    vv - vv.max(axis=1, keepdims=True)])
+    return np.concatenate(
+        [x, extra.reshape(-1, 63)] + [r.reshape(-1, 1) for r in rel], axis=1
     ).astype(np.float32)
 
-    # hist_last_item_in_slate — per-event flag, broadcast to candidates
-    last_items = hist_long.sort_values(['event_row', 'hist_pos']).groupby('event_row').tail(1)
-    last_items = last_items[['event_row', 'item_id']].rename(columns={'item_id': 'last_hist_item'})
-    merged = flat[['event_row', 'item_id']].merge(last_items, on='event_row', how='left')
-    row_is_last = (merged['item_id'] == merged['last_hist_item']).astype(np.int8)
-    tmp = flat[['event_row']].copy()
-    tmp['has_last'] = row_is_last.values
-    event_flag = tmp.groupby('event_row')['has_last'].max()
-    flat['hist_last_item_in_slate'] = flat['event_row'].map(event_flag).astype(np.int8)
 
-    # hist_overlap_ratio — per-event, distinct history items present among candidates
-    hist_set_dict = dict(zip(ev_hist['event_row'], ev_hist['history_items'].apply(set)))
-    slate_set_dict = flat.groupby('event_row')['item_id'].apply(set).to_dict()
-    overlap_dict = {}
-    for eid, h_set in hist_set_dict.items():
-        s_set = slate_set_dict.get(eid, set())
-        overlap_dict[eid] = len(h_set & s_set) / 10.0 if s_set else 0.0
-    flat['hist_overlap_ratio'] = (
-        flat['event_row'].map(overlap_dict).fillna(0.0).astype(np.float32)
+def _context_codes(stamps):
+    return stamps % 86400 // 21600, (((stamps // 86400 + 3) % 7) >= 5).astype(np.int32)
+
+
+def get_context_counts(ds, nu, ni, cutoff):
+    path = FEAT / f"ctxcounts_{cutoff}.npz"
+    if path.exists():
+        with np.load(path) as z:
+            return {k: z[k] for k in z.files}
+    log(f"[context] counts cutoff={cutoff}")
+    idx = np.flatnonzero(ds["ts"] < cutoff)
+    _, first = np.unique(ds["user"][idx], return_index=True)
+    events = idx[first]
+    h = ds["hist"][events]
+    ts = ds["hts"][events]
+    valid = h >= 0
+    users = np.broadcast_to(ds["user"][events, None], h.shape)
+    records = np.rec.fromarrays(
+        [users[valid], h[valid], ts[valid]], names="user,item,timestamp"
     )
+    _, unique = np.unique(records, return_index=True)
+    wi = h[valid][unique]
+    wt = ts[valid][unique]
 
-    # --- ALS ---
-    flat['als_score'] = compute_als_scores(flat, als_artifacts, user2row, item2col)
+    ce, ci = _clicked_events(ds, idx)
+    ids = np.concatenate([wi, ci]).astype(np.int64)
+    stamps = np.concatenate([wt, ds["ts"][ce]]).astype(np.int64)
+    bucket, kind = _context_codes(stamps)
+    joint = bucket * 2 + kind
+    total = np.bincount(ids, minlength=ni)
+    byjoint = np.bincount(ids * 8 + joint, minlength=ni * 8).reshape(ni, 4, 2)
+    globaljoint = (byjoint.sum(axis=0) + 1.0) / (len(ids) + 8.0)
+    result = dict(
+        total=total,
+        bucket=byjoint.sum(axis=2),
+        kind=byjoint.sum(axis=1),
+        joint=byjoint,
+        globaljoint=globaljoint,
+        globalbucket=globaljoint.sum(axis=1),
+        globalkind=globaljoint.sum(axis=0),
+    )
+    np.savez_compressed(path, **result)
+    return result
 
-    # --- Slate context ranks ---
-    g = flat.groupby('event_row', sort=False)
-    flat['item_ctr_rank_in_slate']       = g['item_ctr'].rank(method='average').astype(np.float32)
-    flat['item_ctr_minus_slate_mean']    = (flat['item_ctr'] - g['item_ctr'].transform('mean')).astype(np.float32)
-    flat['als_rank_in_slate']            = g['als_score'].rank(method='average').astype(np.float32)
-    flat['als_score_minus_slate_mean']   = (flat['als_score'] - g['als_score'].transform('mean')).astype(np.float32)
-    flat['is_top_als']                   = (flat['als_score'] == g['als_score'].transform('max')).astype(np.int8)
-    flat['n_candidates_in_history']      = g['in_history'].transform('sum').astype(np.float32)
 
-    # --- Temporal ---
-    dt_arr = pd.to_datetime(flat['timestamp'].values, unit='s', utc=True)
-    hour = dt_arr.hour.values + dt_arr.minute.values / 60.0
-    flat['hour_sin'] = np.sin(2 * np.pi * hour / 24).astype(np.float32)
-    flat['hour_cos'] = np.cos(2 * np.pi * hour / 24).astype(np.float32)
-    dow = dt_arr.weekday.values
-    flat['dow_sin']    = np.sin(2 * np.pi * dow / 7).astype(np.float32)
-    flat['dow_cos']    = np.cos(2 * np.pi * dow / 7).astype(np.float32)
-    flat['is_weekend'] = (dow >= 5).astype(np.int8)
+def _feature_context_prior(ds, events, counts):
+    n = len(events)
+    items = ds["items"][events]
+    e_users = ds["user"][events]
+    b = ds["tb"][events]
+    k = ds["dt"][events]
+    h = ds["hist"][events]
+    ts = ds["hts"][events]
+    valid = h >= 0
+    hb, hk = _context_codes(ts)
 
-    with open(CACHE / "vocab.pkl", "rb") as f:
-        vocab = pickle.load(f)
-    flat['user_idx'] = flat['user_id'].map(vocab['user2idx']).fillna(0).astype(np.int32)
-    flat['item_idx'] = flat['item_id'].map(vocab['item2idx']).fillna(0).astype(np.int32)
+    gb = counts["globalbucket"][b]
+    gk = counts["globalkind"][k]
+    gj = counts["globaljoint"][b, k]
+    total = counts["total"][items]
+    cb = counts["bucket"][items, b[:, None]]
+    ck = counts["kind"][items, k[:, None]]
+    cj = counts["joint"][items, b[:, None], k[:, None]]
 
-    print(f"[feat] {len(flat):,} rows in {time.time()-t0:.1f}s")
-    return flat
+    cols = [np.log1p(total), np.log1p(cb), np.log1p(ck), np.log1p(cj)]
+    for alpha in (5.0, 20.0, 100.0):
+        cols.extend([
+            np.log((cb + alpha * gb[:, None]) / (total + alpha) / gb[:, None]),
+            np.log((ck + alpha * gk[:, None]) / (total + alpha) / gk[:, None]),
+            np.log((cj + alpha * gj[:, None]) / (total + alpha)
+                   / gj[:, None]),
+        ])
+    eb = b
+    ek = k
+    user_counts = [
+        ((hb == eb[:, None]) & valid).sum(axis=1),
+        ((hk == ek[:, None]) & valid).sum(axis=1),
+        ((hb == eb[:, None]) & (hk == ek[:, None]) & valid).sum(axis=1),
+    ]
+    priors = [
+        counts["globalbucket"][eb],
+        counts["globalkind"][ek],
+        counts["globaljoint"][eb, ek],
+    ]
+    cnt = valid.sum(axis=1)
+    for c, p in zip(user_counts, priors):
+        cols.append(
+            np.broadcast_to(
+                (np.log((c + 5.0 * p) / (cnt + 5.0) / p))[:, None], (n, 10)
+            )
+        )
+    raw = np.stack(cols, axis=2)
+    rel = []
+    for col in (0, 1, 3, 4, 5, 6, 7, 9):
+        vv = raw[:, :, col]
+        rel.extend([vv - vv.mean(axis=1, keepdims=True),
+                    vv - vv.max(axis=1, keepdims=True)])
+    return np.concatenate(
+        [raw.reshape(-1, 16)] + [r.reshape(-1, 1) for r in rel], axis=1
+    ).astype(np.float32)
+
+
+def _warm_component_features(ds, events, cutoff, start, nu, ni, train_ds=None):
+    """4 warm scores + 32 decomposition + 32 aligned factor interactions."""
+    train_ds = ds if train_ds is None else train_ds
+    U, V, H, bu, bi = get_warm_model(train_ds, nu, ni, start, cutoff)
+    anchor = get_warm_model(train_ds, nu, ni, start, start + 2 * DAY)[1].astype(np.float64)
+    current = V.astype(np.float64)
+    anchor /= np.maximum(np.linalg.norm(anchor, axis=1, keepdims=True), 1e-12)
+    current /= np.maximum(np.linalg.norm(current, axis=1, keepdims=True), 1e-12)
+    left, _, right = np.linalg.svd(current.T @ anchor, full_matrices=False)
+    rotation = left @ right
+    assert np.max(np.abs(rotation.T @ rotation - np.eye(16))) < 1e-10
+
+    ur = U.astype(np.float64) @ rotation
+    vr = V.astype(np.float64) @ rotation
+    hr = H.astype(np.float64) @ rotation
+    ur = (ur / np.maximum(np.linalg.norm(ur, axis=1, keepdims=True), 1e-12)).astype(np.float32)
+    vr = (vr / np.maximum(np.linalg.norm(vr, axis=1, keepdims=True), 1e-12)).astype(np.float32)
+    hr = hr.astype(np.float32)
+
+    U = U.astype(np.float32)
+    V = V.astype(np.float32)
+    H = H.astype(np.float32)
+    bu = bu.astype(np.float32)
+    bi = bi.astype(np.float32)
+
+    out = np.empty((len(events) * 10, 68), dtype=np.float32)
+    chunk = 20000
+    for offset in range(0, len(events), chunk):
+        e = events[offset:offset + chunk]
+        m = len(e)
+        items = ds["items"][e]
+        users = ds["user"][e]
+        h = ds["hist"][e]
+        valid = h >= 0
+        safe = np.maximum(h, 0)
+        length = valid.sum(axis=1)
+        age = length[:, None] - 1 - np.arange(20)[None, :]
+
+        raw = _predict_events(users, items, h, U, V, H, bu, bi)
+        flat = raw.ravel()
+        rel = (raw - raw.mean(axis=1, keepdims=True)).ravel()
+        rank = (np.argsort(np.argsort(raw, axis=1), axis=1) / 9.0).ravel()
+        warm = np.stack([
+            flat,
+            np.log(np.clip(flat, 1e-8, 1 - 1e-8))
+            - np.log1p(-np.clip(flat, 1e-8, 1 - 1e-8)),
+            rel,
+            rank,
+        ], axis=1)
+
+        hv = H[safe] * valid[:, :, None]
+        z = hv.sum(axis=1) / np.sqrt(np.maximum(length[:, None], 1))
+        u = U[users]
+        v = V[items]
+        direct = np.einsum("ed,ecd->ec", u, v)
+        dynamic = np.einsum("ed,ecd->ec", z, v)
+        un = np.linalg.norm(u, axis=1)
+        zn = np.linalg.norm(z, axis=1)
+        vn = np.linalg.norm(v, axis=2)
+        sim = np.einsum("ehd,ecd->ech", hv, v) * valid[:, None, :]
+        mean = sim.sum(axis=2) / np.maximum(length[:, None], 1)
+        maximum = np.where(valid[:, None, :], sim, -1e6).max(axis=2)
+        maximum[length == 0] = 0.0
+        variance = np.maximum(
+            (sim * sim).sum(axis=2) / np.maximum(length[:, None], 1) - mean * mean,
+            0.0,
+        )
+        recents = []
+        for width in (3, 5):
+            mask = valid & (age < width)
+            recents.append((sim * mask[:, None, :]).sum(axis=2)
+                           / np.maximum(mask.sum(axis=1)[:, None], 1))
+        agreement = (u * z).sum(axis=1) / np.maximum(un * zn, 1e-8)
+        user_bias = np.broadcast_to(bu[users][:, None], direct.shape)
+        item_bias = bi[items]
+        logits = np.clip(-1.8 + user_bias + item_bias + direct + dynamic, -30, 30)
+        ml = np.maximum(logits.max(axis=1, keepdims=True), 0.0)
+        exp = np.exp(logits - ml)
+        prob = exp / (np.exp(-ml) + exp.sum(axis=1, keepdims=True))
+        no_click = 1.0 - prob.sum(axis=1)
+        values = [
+            user_bias, item_bias, direct, dynamic,
+            np.broadcast_to(un[:, None], direct.shape),
+            np.broadcast_to(zn[:, None], direct.shape),
+            vn,
+            direct / np.maximum(un[:, None] * vn, 1e-8),
+            dynamic / np.maximum(zn[:, None] * vn, 1e-8),
+            mean, maximum, np.sqrt(variance), *recents,
+            np.broadcast_to(agreement[:, None], direct.shape),
+            np.broadcast_to(no_click[:, None], direct.shape),
+            direct - dynamic,
+            -1.8 + user_bias + item_bias,
+        ]
+        decomp = np.stack(values, axis=2)
+        rel_cols = []
+        for col in (1, 2, 3, 7, 8, 10, 12):
+            vv = decomp[:, :, col]
+            rel_cols.extend([vv - vv.mean(axis=1, keepdims=True),
+                             vv - vv.max(axis=1, keepdims=True)])
+        decomp = np.concatenate(
+            [decomp] + [r[:, :, None] for r in rel_cols], axis=2
+        ).reshape(-1, 32)
+
+        z_al = hr[safe]
+        z_al = (z_al * valid[:, :, None]).sum(axis=1)
+        z_al = z_al / np.maximum(np.linalg.norm(z_al, axis=1, keepdims=True), 1e-12)
+        v_al = vr[items]
+        u_al = ur[users]
+        aligned = np.concatenate([
+            u_al[:, None, :] * v_al,
+            z_al[:, None, :] * v_al,
+        ], axis=2).reshape(-1, 32)
+
+        row = slice(offset * 10, (offset + m) * 10)
+        out[row, :4] = warm
+        out[row, 4:36] = decomp
+        out[row, 36:68] = aligned
+    assert np.isfinite(out).all()
+    return out
+
+
+def _als_component_features(ds, events, cutoff, start, nu, ni, train_ds=None):
+    """32 exposure-ALS summaries + 32 aligned ALS interactions."""
+    train_ds = ds if train_ds is None else train_ds
+    model = get_als_model(train_ds, nu, ni, start, cutoff)
+    anchor = get_als_model(train_ds, nu, ni, start, start + 2 * DAY)
+    V = model["V"].astype(np.float64)
+    unit_V = V / np.maximum(np.linalg.norm(V, axis=1, keepdims=True), 1e-12)
+    anchor_V = anchor["V"].astype(np.float64)
+    anchor_V /= np.maximum(np.linalg.norm(anchor_V, axis=1, keepdims=True), 1e-12)
+    left, _, right = np.linalg.svd(unit_V.T @ anchor_V, full_matrices=False)
+    rotation = left @ right
+    assert np.max(np.abs(rotation.T @ rotation - np.eye(16))) < 1e-10
+
+    vr = V @ rotation
+    vr /= np.maximum(np.linalg.norm(vr, axis=1, keepdims=True), 1e-12)
+    vr = vr.astype(np.float32)
+    vn_all = np.linalg.norm(model["V"], axis=1)
+    item_exposures = model["item_exposures"]
+    g = float(model["g"])
+
+    out = np.empty((len(events) * 10, 64), dtype=np.float32)
+    chunk = 20000
+    for offset in range(0, len(events), chunk):
+        e = events[offset:offset + chunk]
+        m = len(e)
+        items = ds["items"][e]
+        h = ds["hist"][e]
+        valid = h >= 0
+        safe = np.maximum(h, 0)
+        length = valid.sum(axis=1)
+        age = length[:, None] - 1 - np.arange(20)[None, :]
+
+        u, bias = _als_score(ds, e, model, nu, ni)
+        v = model["V"][items]
+        vn = vn_all[items]
+        direct = np.einsum("ed,ecd->ec", u, v)
+        profile = (model["V"][safe] * valid[:, :, None]).sum(axis=1) / np.maximum(
+            length[:, None], 1
+        )
+        hn = np.linalg.norm(profile, axis=1)
+        history_dot = np.einsum("ed,ecd->ec", profile, v)
+        sim = np.einsum("ehd,ecd->ech", unit_V[safe], unit_V[items]) * valid[:, None, :]
+        mean = sim.sum(axis=2) / np.maximum(length[:, None], 1)
+        maximum = np.where(valid[:, None, :], sim, -1e6).max(axis=2)
+        maximum[length == 0] = 0.0
+        std = np.sqrt(np.maximum(
+            (sim * sim).sum(axis=2) / np.maximum(length[:, None], 1) - mean * mean,
+            0.0,
+        ))
+        recents = []
+        for width in (3, 5):
+            mask = valid & (age < width)
+            recents.append((sim * mask[:, None, :]).sum(axis=2)
+                           / np.maximum(mask.sum(axis=1)[:, None], 1))
+
+        user_bias = np.broadcast_to(bias[:, None], direct.shape)
+        values = [
+            user_bias, model["bi"][items], direct,
+            np.broadcast_to(np.linalg.norm(u, axis=1)[:, None], direct.shape),
+            vn,
+            direct / np.maximum(np.linalg.norm(u, axis=1)[:, None] * vn, 1e-12),
+            g + user_bias + model["bi"][items] + direct,
+            np.broadcast_to(np.log1p(model["exposures"][ds["user"][e]])[:, None],
+                            direct.shape),
+            history_dot,
+            np.broadcast_to(hn[:, None], direct.shape),
+            history_dot / np.maximum(hn[:, None] * vn, 1e-12),
+            maximum, std, *recents,
+            (h[:, None, :] == items[:, :, None]).sum(axis=2),
+            np.broadcast_to(np.log1p(length)[:, None], direct.shape),
+            np.log1p(item_exposures[items]),
+        ]
+        scalar = np.stack(values, axis=2)
+        rel = []
+        for col in (1, 2, 5, 6, 8, 10, 11):
+            vv = scalar[:, :, col]
+            rel.extend([vv - vv.mean(axis=1, keepdims=True),
+                        vv - vv.max(axis=1, keepdims=True)])
+        scalar = np.concatenate(
+            [scalar] + [r[:, :, None] for r in rel], axis=2
+        ).reshape(-1, 32)
+
+        ur = u @ rotation
+        ur /= np.maximum(np.linalg.norm(ur, axis=1, keepdims=True), 1e-12)
+        hr = profile @ rotation
+        hr /= np.maximum(np.linalg.norm(hr, axis=1, keepdims=True), 1e-12)
+        aligned = np.concatenate([
+            ur.astype(np.float32)[:, None, :] * vr[items],
+            hr.astype(np.float32)[:, None, :] * vr[items],
+        ], axis=2).reshape(-1, 32)
+
+        row = slice(offset * 10, (offset + m) * 10)
+        out[row, :32] = scalar
+        out[row, 32:64] = aligned
+    assert np.isfinite(out).all()
+    return out
+
+
+def build_block(stat_ds, feat_ds, nu, ni, start, name, events, cutoff, rebuild=False):
+    path = FEAT / f"block_{name}_c{cutoff}_v4.npy"
+    expected = len(events) * 10
+    if path.exists() and not rebuild:
+        x = np.load(path, mmap_mode="r")
+        if x.shape == (expected, 354):
+            log(f"[features] {name}: cached {x.shape}")
+            return x
+    log(f"[features] {name}: {len(events):,} events cutoff={cutoff}")
+    t = time.time()
+    stats = get_preference(stat_ds, nu, ni, cutoff)
+    x = np.empty((expected, 354), dtype=np.float32)
+    x[:, :190] = _feature_preference(feat_ds, events, stats)
+    log(f"[features] {name}: base 190 done {time.time() - t:.0f}s")
+    x[:, 190:258] = _warm_component_features(
+        feat_ds, events, cutoff, start, nu, ni, train_ds=stat_ds
+    )
+    log(f"[features] {name}: warm/decomp/aligned done {time.time() - t:.0f}s")
+    counts = get_context_counts(stat_ds, nu, ni, cutoff)
+    x[:, 258:290] = _feature_context_prior(feat_ds, events, counts)
+    log(f"[features] {name}: context done {time.time() - t:.0f}s")
+    x[:, 290:354] = _als_component_features(
+        feat_ds, events, cutoff, start, nu, ni, train_ds=stat_ds
+    )
+    log(f"[features] {name}: ALS done {time.time() - t:.0f}s")
+    np.save(path, x)
+    log(f"[features] {name}: saved {x.shape} in {time.time() - t:.0f}s")
+    return x
 
 
 # ---------------------------------------------------------------------------
-# Training
+# Training / submission
 # ---------------------------------------------------------------------------
-def train_lgb(tr_flat, va_flat, feature_cols, num_boost_round=5000):
-    X_tr = tr_flat[feature_cols].astype(np.float32).values
-    y_tr = tr_flat['label'].astype(np.int8).values
-    X_va = va_flat[feature_cols].astype(np.float32).values
-    y_va = va_flat['label'].astype(np.int8).values
+def _day_events(ds, start, day, val_cut=None):
+    lo = start + day * DAY
+    hi = start + (day + 1) * DAY
+    mask = (ds["ts"] >= lo) & (ds["ts"] < hi)
+    if val_cut is not None:
+        mask &= ds["ts"] < val_cut
+    return np.flatnonzero(mask)
 
-    print(f"[train] X={X_tr.shape}  pos_rate={y_tr.mean():.4f}")
 
-    params = {
-        'objective': 'binary',
-        'metric': 'auc',
-        'learning_rate': 0.03,
-        'num_leaves': 255,
-        'min_data_in_leaf': 100,
-        'feature_fraction': 0.8,
-        'bagging_fraction': 0.8,
-        'bagging_freq': 1,
-        'lambda_l2': 1.0,
-        'cat_smooth': 20,
-        'cat_l2': 10,
-        'verbose': -1,
-        'num_threads': 16,
-        'seed': 42,
-    }
+def _first_event_cohort(ds, start, day, val_cut=None):
+    events = _day_events(ds, start, day, val_cut)
+    _, first = np.unique(ds["user"][events], return_index=True)
+    return events[first]
 
-    categorical_cols = [c for c in ('user_idx', 'item_idx') if c in feature_cols]
-    dtrain = lgb.Dataset(X_tr, y_tr, feature_name=feature_cols,
-                        categorical_feature=categorical_cols)
-    dval   = lgb.Dataset(X_va, y_va, reference=dtrain, feature_name=feature_cols)
+
+def _assemble(ds, blocks, path, rebuild=False):
+    rows = sum(len(b["events"]) * 10 for b in blocks)
+    if path.exists() and not rebuild:
+        x = np.load(path, mmap_mode="r")
+        y_path = path.parent / (path.stem + "_labels.npy")
+        if y_path.exists() and x.shape[0] == rows:
+            y = np.load(y_path)
+            if x.shape[0] == len(y):
+                return x, y
+    x = np.empty((rows, 354), dtype=np.float32)
+    ys = []
+    offset = 0
+    for b in blocks:
+        mm = build_block(ds, ds, b["nu"], b["ni"], b["start"], b["name"],
+                         b["events"], b["cutoff"], rebuild=rebuild)
+        n = len(b["events"]) * 10
+        x[offset:offset + n] = mm
+        ys.append(ds["labels"][b["events"]].ravel().astype(np.int8))
+        offset += n
+    y = np.concatenate(ys)
+    np.save(path, x)
+    np.save(path.parent / (path.stem + "_labels.npy"), y)
+    return x, y
+
+
+def train_lightgbm(x, y, xv, yv, num_threads=32, seed=42,
+                   num_boost_round=1800, early_stopping=120, verbose=50):
+    params = dict(
+        objective="binary",
+        metric="auc",
+        num_leaves=31,
+        learning_rate=0.04,
+        min_data_in_leaf=200,
+        feature_fraction=0.9,
+        bagging_fraction=0.8,
+        bagging_freq=1,
+        lambda_l2=2.0,
+        max_bin=127,
+        force_col_wise=True,
+        deterministic=True,
+        num_threads=num_threads,
+        seed=seed,
+        verbosity=-1,
+    )
+    dtrain = lgb.Dataset(x, label=y, free_raw_data=True)
+    dvalid = lgb.Dataset(xv, label=yv, reference=dtrain, free_raw_data=True)
+    callbacks = [lgb.log_evaluation(verbose)]
+    if early_stopping:
+        callbacks.append(lgb.early_stopping(early_stopping, first_metric_only=True))
+    model = lgb.train(
+        params, dtrain, num_boost_round=num_boost_round,
+        valid_sets=[dvalid], valid_names=["validation"], callbacks=callbacks,
+    )
+    trees = int(model.best_iteration or model.current_iteration())
+    return model, trees
+
+
+def _write_submission(rowids, pred, path):
+    out = pd.DataFrame({"rowid": rowids, "predicted_probability": pred})
+    assert len(out) == 529390
+    assert out["rowid"].is_unique
+    assert np.isfinite(out["predicted_probability"]).all()
+    out.to_csv(path, index=False)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--val-only", action="store_true",
+                    help="train/evaluate only; do not fit final model or write submission")
+    ap.add_argument("--rebuild-data", action="store_true")
+    ap.add_argument("--rebuild-features", action="store_true")
+    ap.add_argument("--train-days", default="3,4,5")
+    ap.add_argument("--final-days", default="4,5,6")
+    ap.add_argument("--threads", type=int, default=32)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--smoke", type=int, default=0,
+                    help="limit events per block for a quick shape/runtime check")
+    args = ap.parse_args()
+    set_num_threads(args.threads)
 
     t0 = time.time()
-    model = lgb.train(
-        params, dtrain,
-        num_boost_round=num_boost_round,
-        valid_sets=[dval], valid_names=['val'],
-        callbacks=[lgb.early_stopping(200, verbose=True), lgb.log_evaluation(100)],
+    tr, ev, nu, ni, start, rowids, item_vals = prepare_data(args.rebuild_data)
+    ds = tr
+    val_cut = int(np.quantile(ds["ts"], 0.85))
+    log(f"[data] validation cutoff={val_cut} "
+        f"({pd.to_datetime(val_cut, unit='s')})")
+
+    train_days = [int(x) for x in args.train_days.split(",") if x != ""]
+    final_days = [int(x) for x in args.final_days.split(",") if x != ""]
+
+    def block(name, events, cutoff, smoke=True):
+        if args.smoke and len(events) > args.smoke and name != "eval":
+            events = events[: args.smoke]
+        return dict(name=name, events=events, cutoff=cutoff,
+                    nu=nu, ni=ni, start=start)
+
+    val_events = np.flatnonzero(ds["ts"] >= val_cut)
+    val_blocks = [block("val", val_events, val_cut, smoke=True)]
+    train_blocks = [
+        block(f"day{d}", _day_events(ds, start, d, val_cut if d == 5 else None),
+              start + d * DAY)
+        for d in train_days
+    ]
+
+    x, y = _assemble(ds, train_blocks, FEAT / "train_matrix.npy",
+                     args.rebuild_features)
+    xv, yv = _assemble(ds, val_blocks, FEAT / "val_matrix.npy", False)
+    val_used = val_blocks[0]["events"]
+    log(f"[train] X={x.shape} pos_rate={y.mean():.5f} "
+        f"val={xv.shape} val_pos={yv.mean():.5f}")
+
+    model, trees = train_lightgbm(
+        x, y, xv, yv, num_threads=args.threads, seed=args.seed
     )
-    print(f"[train] done in {time.time()-t0:.1f}s  best_iter={model.best_iteration}")
+    pred = model.predict(xv, num_iteration=trees)
+    auc = float(roc_auc_score(yv, pred))
+    log(f"[RESULT] full temporal holdout AUC = {auc:.5f} "
+        f"(trees={trees})")
 
-    val_preds = model.predict(X_va, num_iteration=model.best_iteration)
-    val_auc   = roc_auc_score(y_va, val_preds)
-    print(f"\n[RESULT] LightGBM val AUC = {val_auc:.5f}\n")
+    # Reference-comparable first-event-per-user day-6 cohort.
+    try:
+        cohort = _first_event_cohort(ds, start, 6)
+        lookup = {int(e): i for i, e in enumerate(val_used)}
+        if all(int(e) in lookup for e in cohort):
+            rows = []
+            for e in cohort:
+                i = lookup[int(e)]
+                rows.extend(range(i * 10, i * 10 + 10))
+            rows = np.asarray(rows, dtype=np.int64)
+            log(f"[RESULT] day-6 first-event cohort AUC = "
+                f"{roc_auc_score(yv[rows], pred[rows]):.5f} "
+                f"({len(cohort):,} events)")
+    except Exception as exc:
+        log(f"[metric] cohort check skipped: {exc}")
 
-    imp = pd.DataFrame({
-        'feature': feature_cols,
-        'gain': model.feature_importance('gain'),
-    }).sort_values('gain', ascending=False)
-    print("[imp] top 15 features:")
-    print(imp.head(15).to_string(index=False))
-    return model, val_auc
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--val_frac", type=float, default=0.15)
-    p.add_argument("--num_boost_round", type=int, default=5000)
-    p.add_argument("--skip_als", action="store_true")
-    p.add_argument("--sample", type=int, default=0,
-                   help="Subsample N events per split (0=all). Use for quick tests.")
-    args = p.parse_args()
-
-    if not HAS_IMPLICIT and not args.skip_als:
-        print("[warn] 'implicit' not installed — ALS will be zero.")
-        print("[warn] For full signal: uv pip install implicit, then re-run.")
-
-    train_ev, eval_ev = load_events()
-    tr_ev, va_ev, cutoff = temporal_split(train_ev, args.val_frac)
-
-    if args.sample:
-        tr_ev = tr_ev.sample(min(args.sample, len(tr_ev)), random_state=42).reset_index(drop=True)
-        va_ev = va_ev.sample(min(args.sample, len(va_ev)), random_state=42).reset_index(drop=True)
-        print(f"[sample] tr={len(tr_ev):,}  va={len(va_ev):,}  (eval unchanged)")
-
-    tr_flat = explode_candidates(tr_ev, has_labels=True)
-    va_flat = explode_candidates(va_ev, has_labels=True)
-    ev_flat = explode_candidates(eval_ev, has_labels=False)
-
-    print("[stats] computing item stats...")
-    item_stats, global_ctr = compute_item_stats(tr_flat)
-    print(f"[stats] {len(item_stats):,} items  global_ctr={global_ctr:.5f}")
-
-    print("[stats] computing recent item CTR...")
-    item_recent = compute_item_ctr_recent(tr_flat, cutoff)
-
-    print("[stats] computing user stats...")
-    user_stats = compute_user_stats(tr_flat)
-    print(f"[stats] {len(user_stats):,} users")
-
-    if args.skip_als:
-        print("[als] skipped via --skip_als")
-        als_artifacts, user2row, item2col = None, {}, {}
-    else:
-        als_artifacts, user2row, item2col = train_als(tr_flat)
-
-    print("[feat] building train features...")
-    tr_flat = add_features(tr_flat, tr_ev, item_stats, item_recent, user_stats,
-                            als_artifacts, user2row, item2col, global_ctr, cutoff)
-    print("[feat] building val features...")
-    va_flat = add_features(va_flat, va_ev, item_stats, item_recent, user_stats,
-                            als_artifacts, user2row, item2col, global_ctr, cutoff)
-    print("[feat] building eval features...")
-    ev_flat = add_features(ev_flat, eval_ev, item_stats, item_recent, user_stats,
-                            als_artifacts, user2row, item2col, global_ctr, cutoff)
-
-    # Drop constant features (won't split usefully)
-    feature_cols = FEATURE_COLS.copy()
-    feature_cols.extend([f'item2vec_dim_{i}' for i in range(64)])
-    feature_cols.extend(['user_idx', 'item_idx', 'item2vec_sim_user_profile'])
-    constant = [c for c in feature_cols if tr_flat[c].nunique() <= 1]
-    if constant:
-        print(f"[warn] dropping constant features: {constant}")
-        for c in constant:
-            feature_cols.remove(c)
-
-    model, val_auc = train_lgb(tr_flat, va_flat, feature_cols, args.num_boost_round)
-    model.save_model("gbdt_model.txt")
-    print("[save] gbdt_model.txt")
-
-    # --- Predict eval and save submission ---
-    X_ev = ev_flat[feature_cols].astype(np.float32).values
-    ev_preds = model.predict(X_ev, num_iteration=model.best_iteration)
-
-    sub = pd.DataFrame({
-        'rowid': ev_flat['rowid'].values,
-        'predicted_probability': ev_preds,
+    model.save_model(str(Path("gbdt_model.txt")), num_iteration=trees)
+    val_df = pd.DataFrame({
+        "event_row": np.repeat(np.arange(len(val_used)), 10),
+        "item_id": np.asarray(item_vals)[ds["items"][val_used].ravel()],
+        "label": yv,
+        "pred": pred,
     })
-    sub.to_csv("submission_gbdt.csv", index=False)
-    print(f"[save] submission_gbdt.csv  rows={len(sub)}")
-    print(f"[save] val AUC = {val_auc:.5f}")
+    val_df.to_parquet("val_preds_gbdt.parquet", index=False)
+    log(f"[val] predictions written val_preds_gbdt.parquet")
 
-    # Save val predictions for later blend analysis
-    X_va = va_flat[feature_cols].astype(np.float32).values
-    va_out = pd.DataFrame({
-        'event_row': va_flat['event_row'].values,
-        'item_id':   va_flat['item_id'].values,
-        'label':     va_flat['label'].values,
-        'pred':      model.predict(X_va, num_iteration=model.best_iteration),
-    })
-    va_out.to_parquet("val_preds_gbdt.parquet")
-    print(f"[save] val_preds_gbdt.parquet  rows={len(va_out):,}")
+    if args.val_only:
+        log(f"[done] {time.time() - t0:.0f}s")
+        return
+
+    # Final model: days 4-6, evaluation features cut off at day 7.
+    final_blocks = [
+        block(f"day{d}full", _day_events(ds, start, d), start + d * DAY)
+        for d in final_days
+    ]
+    xf, yf = _assemble(ds, final_blocks, FEAT / "final_matrix.npy",
+                       args.rebuild_features)
+    log(f"[final] train rows={len(yf):,} trees={trees}")
+    final_model, _ = train_lightgbm(
+        xf, yf, xv, yv, num_threads=args.threads, seed=args.seed,
+        num_boost_round=trees, early_stopping=0, verbose=200,
+    )
+    eval_events = np.arange(len(ev["ts"]))
+    xe = build_block(ds, ev, nu, ni, start, "eval", eval_events,
+                     start + 7 * DAY, rebuild=args.rebuild_features)
+    prob = final_model.predict(xe)
+    _write_submission(rowids, prob, "submission_gbdt.csv")
+    log(f"[final] submission_gbdt.csv written; {time.time() - t0:.0f}s")
 
 
 if __name__ == "__main__":
