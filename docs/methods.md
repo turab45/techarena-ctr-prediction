@@ -115,7 +115,7 @@ A development microbenchmark on the RTX 4090 measured SmoothAUC forward/backward
 
 Prediction reconstructs the architecture from the checkpoint configuration, restores its weights, and maps the resulting scores to evaluation `rowid` values. It does not reload item2vec: the learned embeddings are already inside the checkpoint.
 
-The optional blender merges two `rowid,predicted_probability` files, converts each prediction column to percentile ranks, and takes a weighted average. It is intended to combine complementary rankings, such as a tree model and the sequence/slate model. No new-transformer blend result has been measured here. The current inner join assumes complete, unique row-ID coverage; validate inputs before using it. Rank averages should not be interpreted as calibrated probabilities.
+The optional blender merges two `rowid,predicted_probability` files, converts each prediction column to percentile ranks, and takes a weighted average. It is intended to combine complementary rankings, such as a tree model and the sequence/slate model. No new-transformer blend result has been measured here. It rejects duplicate or missing IDs, mismatched ID coverage, nonfinite scores, and weights outside [0, 1]. Rank averages should not be interpreted as calibrated probabilities.
 
 ## Reference methods from the original repository
 

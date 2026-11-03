@@ -80,6 +80,35 @@ Keep the vocabulary and evaluation cache from the same preparation run as the ch
 
 ## Outputs and optional blending
 
+For the CPU GBDT pipeline, run from the repository root:
+
+```bash
+OPENBLAS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 uv run python -u gbdt.py --rebuild-features > gbdt_position_run.log 2>&1
+# In another terminal, follow progress:
+tail -f gbdt_position_run.log
+```
+
+This prepares missing event caches from the CSV files in chunks, builds 355
+features including candidate slot position, and trains seeds 42, 43, and 44
+with 63 leaves, learning rate 0.03, minimum leaf size 100, and feature fraction
+0.7. It averages probabilities for both validation and evaluation. Each final
+seed uses its own validation-selected tree count. Models, validation predictions,
+metrics, and `submission_gbdt.csv` are saved in `artifacts/gbdt_position_v5/`;
+the earlier root submission is preserved. Feature caches use a separate v5
+directory, so old 354-column matrices cannot be reused. Omit `--rebuild-features`
+on later runs to reuse the new features.
+
+Use `--seeds 42` for a single-seed comparison, `--seeds 42,43,44` to specify
+seeds explicitly, and `--output-dir artifacts/my_run` to keep experiments separate.
+Candidate position is included as an experiment: slot click rates are nearly
+uniform in this dataset, and its measured standalone validation AUC is 0.50024.
+This feature is not established as the explanation for the leaderboard gap.
+
+The thread default adapts to the local
+Numba limit (up to 32); use `--threads 8` to reduce CPU usage or `--val-only` to
+stop after validation. Initial feature generation also fits factor models and
+can take substantially longer than subsequent runs with cached features.
+
 | Artifact | Purpose |
 |---|---|
 | `cache/train.pkl`, `cache/eval.pkl` | One row per event, with candidate lists and parsed histories |
@@ -96,7 +125,7 @@ uv run python pipeline.py blend \
   --out submission_blend.csv --wa 0.4
 ```
 
-Here `--wa 0.4` gives the first file 40% weight. This is an example configuration; no blended result is recorded for the new transformer. Both files must cover the same unique row IDs: the current blender uses an inner join and does not validate complete coverage. Rank-blended scores are ranking scores, not calibrated click probabilities. Uploading a submission is a separate step.
+Here `--wa 0.4` gives the first file 40% weight. This is an example configuration; no blended result is recorded for the new transformer. The blender verifies that both files cover exactly the same unique row IDs and contain finite scores. Rank-blended scores are ranking scores, not calibrated click probabilities. Uploading a submission is a separate step.
 
 ## Checks
 

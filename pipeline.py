@@ -1,5 +1,6 @@
 # pipeline.py
 import argparse, json, math, pickle, time
+from itertools import chain
 import datetime as dt
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -25,16 +26,11 @@ def parse_list(s):
     except Exception: return []
 
 
-def load_events(csv_path, cache_path, has_labels):
+def load_events(csv_path, cache_path, has_labels, chunksize=100_000):
     if Path(cache_path).exists():
         print(f"[cache] {cache_path}")
         return pd.read_pickle(cache_path)
-    print(f"[load] {csv_path}")
-    df = pd.read_csv(csv_path)
-    print(f"  {len(df):,} rows  {df['event_id'].nunique():,} events")
-    df['position'] = df.groupby('event_id', sort=False).cumcount()
-    df = df.sort_values(['event_id', 'position'])
-
+    print(f"[load] {csv_path}", flush=True)
     agg = dict(
         user_id=('user_id', 'first'),
         timestamp=('timestamp', 'first'),
@@ -47,7 +43,22 @@ def load_events(csv_path, cache_path, has_labels):
     if has_labels: agg['labels'] = ('clicked', list)
     else:          agg['rowids'] = ('rowid', list)
 
-    events = df.groupby('event_id', sort=False).agg(**agg).reset_index()
+    # Collapse repeated history strings before reading the next CSV chunk.
+    # Merge partial slates too, including events spanning chunk boundaries.
+    parts = []
+    rows = 0
+    for df in pd.read_csv(csv_path, chunksize=chunksize):
+        parts.append(df.groupby('event_id', sort=False).agg(**agg))
+        rows += len(df)
+        if len(parts) % 10 == 0:
+            print(f"  {rows:,} rows loaded", flush=True)
+    partial = pd.concat(parts)
+    merge = {col: 'first' for col in partial.columns}
+    for col in ('items', 'labels' if has_labels else 'rowids'):
+        merge[col] = lambda values: list(chain.from_iterable(values))
+    events = partial.groupby(level=0, sort=True).agg(merge).reset_index()
+    del parts, partial
+    print(f"  {rows:,} rows  {len(events):,} events", flush=True)
     events['history_items']      = events['history_str'].map(parse_list)
     events['history_timestamps'] = events['history_ts_str'].map(parse_list)
     events = events.drop(columns=['history_str', 'history_ts_str'])
@@ -577,11 +588,20 @@ def cmd_predict(args):
 # ---------------------------------------------------------------------------
 def cmd_blend(args):
     """Rank-average two rowid-scored files (e.g. GBDT + transformer)."""
+    if not 0 <= args.wa <= 1:
+        raise ValueError('Blend weight must be between 0 and 1')
     a = pd.read_csv(args.a)[["rowid", "predicted_probability"]].rename(
         columns={"predicted_probability": "s_a"})
     b = pd.read_csv(args.b)[["rowid", "predicted_probability"]].rename(
         columns={"predicted_probability": "s_b"})
-    m = a.merge(b, on="rowid")
+    for name, frame, score in (('a', a, 's_a'), ('b', b, 's_b')):
+        if frame.empty or frame.rowid.isna().any() or not frame.rowid.is_unique:
+            raise ValueError(f'Input {name} must have nonempty, unique, nonmissing row IDs')
+        if not np.isfinite(frame[score]).all():
+            raise ValueError(f'Input {name} contains nonfinite scores')
+    m = a.merge(b, on="rowid", how='outer', validate='one_to_one', indicator=True)
+    if not m['_merge'].eq('both').all():
+        raise ValueError('Blend inputs must cover exactly the same row IDs')
     m["predicted_probability"] = (args.wa * m["s_a"].rank(pct=True)
                                   + (1 - args.wa) * m["s_b"].rank(pct=True))
     m[["rowid", "predicted_probability"]].to_csv(args.out, index=False)

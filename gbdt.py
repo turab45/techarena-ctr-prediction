@@ -2,7 +2,7 @@
 """Single-file GBDT pipeline for the TechArena CTR task.
 
 This ports the reference project's strongest tabular recipe into one file:
-  * V6 preference features (190)
+  * V6 preference features including candidate position (191)
   * warm-16 choice-factor score + decomposition + aligned factor interactions (68)
   * warm clicked-context priors (32)
   * exposure-aware ALS summaries + aligned ALS interactions (64)
@@ -24,14 +24,16 @@ from pathlib import Path
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
-from numba import njit, prange, set_num_threads
+from numba import config as numba_config, njit, prange, set_num_threads
 from scipy.sparse import coo_matrix
 from sklearn.decomposition import TruncatedSVD
 from sklearn.metrics import roc_auc_score
 from sklearn.preprocessing import normalize
 
 CACHE = Path("cache")
-FEAT = CACHE / "features_gbdt_v4"
+FEATURE_VERSION = 5
+N_FEATURES = 355
+FEAT = CACHE / f"features_gbdt_v{FEATURE_VERSION}"
 FEAT.mkdir(parents=True, exist_ok=True)
 DAY = 86400
 DATA_VERSION = 4
@@ -80,6 +82,11 @@ def _encode_dataframe(df, umap, imap, labelled):
 
 
 def prepare_data(rebuild=False):
+    if not all((CACHE / name).exists() for name in ("train.pkl", "eval.pkl")):
+        from pipeline import load_events
+        log("[data] preparing missing event caches from CSV")
+        load_events("data/train.csv", CACHE / "train.pkl", True)
+        load_events("data/evaluation.csv", CACHE / "eval.pkl", False)
     data_path = CACHE / "gbdt_data.npz"
     meta_path = CACHE / "gbdt_data_meta.json"
     if data_path.exists() and meta_path.exists() and not rebuild:
@@ -723,7 +730,7 @@ def _als_score(ds, events, model, nu, ni):
 # Feature builders
 # ---------------------------------------------------------------------------
 def _feature_core(ds, events, extra_stats):
-    """13 core + 12 extra + 27 relative features from core/core_v2."""
+    """14 core (including slot position) + 12 extra + 27 relative features."""
     g, ui, uc, ii, ic, emb = extra_stats[0]
     emb64, profiles = extra_stats[1], extra_stats[2]
     n = len(events)
@@ -756,6 +763,7 @@ def _feature_core(ds, events, extra_stats):
         ((((ic[safe] + 50.0 * g) / (ii[safe] + 50.0)) * valid).sum(axis=1)
          / np.maximum(length, 1))[:, None].repeat(10, 1),
         np.broadcast_to(((ds["ts"][events] % 86400) / 86400.0)[:, None], (n, 10)),
+        np.broadcast_to(np.arange(10), (n, 10)),
     ]
     x = np.stack(cols, axis=2)
 
@@ -781,7 +789,10 @@ def _feature_core(ds, events, extra_stats):
     x = np.concatenate([x, np.stack(vals, axis=2)], axis=2)
 
     rel = []
-    for col in (1, 8, 9, 13, 14, 15, 19, 20, 22):
+    # Position was inserted at index 13. Preserve every existing similarity
+    # feature's relative transforms rather than accidentally shifting them.
+    # Relative transforms of position itself are redundant with position.
+    for col in (1, 8, 9, 14, 15, 16, 20, 21, 23):
         vv = x[:, :, col]
         rel.extend([
             vv - vv.mean(axis=1, keepdims=True),
@@ -1281,27 +1292,27 @@ def _als_component_features(ds, events, cutoff, start, nu, ni, train_ds=None):
 
 
 def build_block(stat_ds, feat_ds, nu, ni, start, name, events, cutoff, rebuild=False):
-    path = FEAT / f"block_{name}_c{cutoff}_v4.npy"
+    path = FEAT / f"block_{name}_c{cutoff}_v{FEATURE_VERSION}.npy"
     expected = len(events) * 10
     if path.exists() and not rebuild:
         x = np.load(path, mmap_mode="r")
-        if x.shape == (expected, 354):
+        if x.shape == (expected, N_FEATURES):
             log(f"[features] {name}: cached {x.shape}")
             return x
     log(f"[features] {name}: {len(events):,} events cutoff={cutoff}")
     t = time.time()
     stats = get_preference(stat_ds, nu, ni, cutoff)
-    x = np.empty((expected, 354), dtype=np.float32)
-    x[:, :190] = _feature_preference(feat_ds, events, stats)
-    log(f"[features] {name}: base 190 done {time.time() - t:.0f}s")
-    x[:, 190:258] = _warm_component_features(
+    x = np.empty((expected, N_FEATURES), dtype=np.float32)
+    x[:, :191] = _feature_preference(feat_ds, events, stats)
+    log(f"[features] {name}: base 191 done {time.time() - t:.0f}s")
+    x[:, 191:259] = _warm_component_features(
         feat_ds, events, cutoff, start, nu, ni, train_ds=stat_ds
     )
     log(f"[features] {name}: warm/decomp/aligned done {time.time() - t:.0f}s")
     counts = get_context_counts(stat_ds, nu, ni, cutoff)
-    x[:, 258:290] = _feature_context_prior(feat_ds, events, counts)
+    x[:, 259:291] = _feature_context_prior(feat_ds, events, counts)
     log(f"[features] {name}: context done {time.time() - t:.0f}s")
-    x[:, 290:354] = _als_component_features(
+    x[:, 291:355] = _als_component_features(
         feat_ds, events, cutoff, start, nu, ni, train_ds=stat_ds
     )
     log(f"[features] {name}: ALS done {time.time() - t:.0f}s")
@@ -1333,11 +1344,11 @@ def _assemble(ds, blocks, path, rebuild=False):
     if path.exists() and not rebuild:
         x = np.load(path, mmap_mode="r")
         y_path = path.parent / (path.stem + "_labels.npy")
-        if y_path.exists() and x.shape[0] == rows:
+        if y_path.exists() and x.shape == (rows, N_FEATURES):
             y = np.load(y_path)
             if x.shape[0] == len(y):
                 return x, y
-    x = np.empty((rows, 354), dtype=np.float32)
+    x = np.empty((rows, N_FEATURES), dtype=np.float32)
     ys = []
     offset = 0
     for b in blocks:
@@ -1358,10 +1369,10 @@ def train_lightgbm(x, y, xv, yv, num_threads=32, seed=42,
     params = dict(
         objective="binary",
         metric="auc",
-        num_leaves=31,
-        learning_rate=0.04,
-        min_data_in_leaf=200,
-        feature_fraction=0.9,
+        num_leaves=63,
+        learning_rate=0.03,
+        min_data_in_leaf=100,
+        feature_fraction=0.7,
         bagging_fraction=0.8,
         bagging_freq=1,
         lambda_l2=2.0,
@@ -1393,6 +1404,39 @@ def _write_submission(rowids, pred, path):
     out.to_csv(path, index=False)
 
 
+def train_ensemble(x, y, xv, yv, seeds, output_dir, num_threads,
+                   rounds=None, prediction_x=None):
+    """Fit seeds sequentially and average probabilities with bounded memory.
+
+    Final fits reuse each seed's own validation-selected tree count. This keeps
+    final inference consistent with the validation ensemble.
+    """
+    total = None
+    tree_counts = []
+    individual = {}
+    stage = "final" if rounds is not None else "validation"
+    for index, seed in enumerate(seeds):
+        log(f"[{stage}] training seed={seed}")
+        options = {} if rounds is None else dict(
+            num_boost_round=rounds[index], early_stopping=0, verbose=200)
+        model, trees = train_lightgbm(
+            x, y, xv, yv, num_threads=num_threads, seed=seed, **options)
+        scores = model.predict(xv if prediction_x is None else prediction_x,
+                               num_iteration=trees)
+        if not np.isfinite(scores).all():
+            raise ValueError(f"Nonfinite predictions for seed {seed}")
+        total = scores.copy() if total is None else total + scores
+        tree_counts.append(trees)
+        model.save_model(str(output_dir / f"gbdt_{stage}_seed{seed}.txt"),
+                         num_iteration=trees)
+        if rounds is None:
+            individual[str(seed)] = float(roc_auc_score(yv, scores))
+            log(f"[validation] seed={seed} AUC={individual[str(seed)]:.6f} trees={trees}")
+        del model, scores
+        gc.collect()
+    return total / len(seeds), tree_counts, individual
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--val-only", action="store_true",
@@ -1401,12 +1445,23 @@ def main():
     ap.add_argument("--rebuild-features", action="store_true")
     ap.add_argument("--train-days", default="3,4,5")
     ap.add_argument("--final-days", default="4,5,6")
-    ap.add_argument("--threads", type=int, default=32)
+    ap.add_argument("--threads", type=int, default=min(32, numba_config.NUMBA_NUM_THREADS))
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--seeds", help="comma-separated ensemble seeds; default: --seed and next two")
+    ap.add_argument("--output-dir", type=Path, default=Path("artifacts/gbdt_position_v5"))
     ap.add_argument("--smoke", type=int, default=0,
                     help="limit events per block for a quick shape/runtime check")
     args = ap.parse_args()
+    if not 1 <= args.threads <= numba_config.NUMBA_NUM_THREADS:
+        ap.error(f"--threads must be between 1 and {numba_config.NUMBA_NUM_THREADS}")
+    try:
+        seeds = [int(s) for s in args.seeds.split(",")] if args.seeds else list(range(args.seed, args.seed + 3))
+    except ValueError:
+        ap.error("--seeds must be comma-separated integers")
+    if len(set(seeds)) != len(seeds) or any(s < 0 or s >= 2**31 for s in seeds):
+        ap.error("seeds must be distinct integers between 0 and 2147483647")
     set_num_threads(args.threads)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
 
     t0 = time.time()
     tr, ev, nu, ni, start, rowids, item_vals = prepare_data(args.rebuild_data)
@@ -1434,18 +1489,17 @@ def main():
 
     x, y = _assemble(ds, train_blocks, FEAT / "train_matrix.npy",
                      args.rebuild_features)
-    xv, yv = _assemble(ds, val_blocks, FEAT / "val_matrix.npy", False)
+    xv, yv = _assemble(ds, val_blocks, FEAT / "val_matrix.npy", args.rebuild_features)
     val_used = val_blocks[0]["events"]
     log(f"[train] X={x.shape} pos_rate={y.mean():.5f} "
         f"val={xv.shape} val_pos={yv.mean():.5f}")
 
-    model, trees = train_lightgbm(
-        x, y, xv, yv, num_threads=args.threads, seed=args.seed
-    )
-    pred = model.predict(xv, num_iteration=trees)
+    pred, tree_counts, individual = train_ensemble(
+        x, y, xv, yv, seeds, args.output_dir, args.threads)
     auc = float(roc_auc_score(yv, pred))
     log(f"[RESULT] full temporal holdout AUC = {auc:.5f} "
-        f"(trees={trees})")
+        f"(seeds={seeds} trees={tree_counts})")
+    cohort_auc = None
 
     # Reference-comparable first-event-per-user day-6 cohort.
     try:
@@ -1457,25 +1511,36 @@ def main():
                 i = lookup[int(e)]
                 rows.extend(range(i * 10, i * 10 + 10))
             rows = np.asarray(rows, dtype=np.int64)
+            cohort_auc = float(roc_auc_score(yv[rows], pred[rows]))
             log(f"[RESULT] day-6 first-event cohort AUC = "
-                f"{roc_auc_score(yv[rows], pred[rows]):.5f} "
+                f"{cohort_auc:.5f} "
                 f"({len(cohort):,} events)")
     except Exception as exc:
         log(f"[metric] cohort check skipped: {exc}")
 
-    model.save_model(str(Path("gbdt_model.txt")), num_iteration=trees)
     val_df = pd.DataFrame({
         "event_row": np.repeat(np.arange(len(val_used)), 10),
         "item_id": np.asarray(item_vals)[ds["items"][val_used].ravel()],
         "label": yv,
         "pred": pred,
     })
-    val_df.to_parquet("val_preds_gbdt.parquet", index=False)
-    log(f"[val] predictions written val_preds_gbdt.parquet")
+    val_path = args.output_dir / "val_preds_gbdt.parquet"
+    val_df.to_parquet(val_path, index=False)
+    log(f"[val] predictions written {val_path}")
+    report = dict(feature_version=FEATURE_VERSION, features=N_FEATURES,
+                  seeds=seeds, trees=tree_counts, individual_auc=individual,
+                  validation_auc=auc, day6_first_event_auc=cohort_auc,
+                  validation_cutoff=val_cut, train_days=train_days,
+                  final_days=final_days, smoke=args.smoke,
+                  feature_cache=str(FEAT), final_complete=False)
+    (args.output_dir / "metrics.json").write_text(json.dumps(report, indent=2) + "\n")
 
     if args.val_only:
         log(f"[done] {time.time() - t0:.0f}s")
         return
+
+    del x, y, val_df
+    gc.collect()
 
     # Final model: days 4-6, evaluation features cut off at day 7.
     final_blocks = [
@@ -1484,17 +1549,19 @@ def main():
     ]
     xf, yf = _assemble(ds, final_blocks, FEAT / "final_matrix.npy",
                        args.rebuild_features)
-    log(f"[final] train rows={len(yf):,} trees={trees}")
-    final_model, _ = train_lightgbm(
-        xf, yf, xv, yv, num_threads=args.threads, seed=args.seed,
-        num_boost_round=trees, early_stopping=0, verbose=200,
-    )
+    log(f"[final] train rows={len(yf):,} trees={tree_counts}")
     eval_events = np.arange(len(ev["ts"]))
     xe = build_block(ds, ev, nu, ni, start, "eval", eval_events,
                      start + 7 * DAY, rebuild=args.rebuild_features)
-    prob = final_model.predict(xe)
-    _write_submission(rowids, prob, "submission_gbdt.csv")
-    log(f"[final] submission_gbdt.csv written; {time.time() - t0:.0f}s")
+    prob, _, _ = train_ensemble(
+        xf, yf, xv, yv, seeds, args.output_dir, args.threads,
+        rounds=tree_counts, prediction_x=xe)
+    submission_path = args.output_dir / "submission_gbdt.csv"
+    _write_submission(rowids, prob, submission_path)
+    report.update(final_complete=True, elapsed_seconds=time.time() - t0,
+                  submission=str(submission_path))
+    (args.output_dir / "metrics.json").write_text(json.dumps(report, indent=2) + "\n")
+    log(f"[final] {submission_path} written; {time.time() - t0:.0f}s")
 
 
 if __name__ == "__main__":
