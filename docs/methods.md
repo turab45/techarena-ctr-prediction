@@ -32,7 +32,9 @@ ROC AUC is computed over flattened candidate labels and sigmoid scores across al
 | Event-history overlap | Candidate membership in its own supplied event history, compared for positives and negatives | Whether the histories are relevant to the target event |
 | Context variability | Distinct `time_bucket` and `day_type` counts, plus the positive rate | Whether context features vary and how sparse clicks are |
 
-The diagnostic script splits CSV rows at a timestamp quantile; classifier training splits event records. They need not select identical events if slate sizes vary. Its prior-click indicator also differs from the classifier's supplied-history count feature. No numeric diagnostic AUC outputs were supplied for this documentation, so none are claimed.
+The diagnostic script splits CSV rows at a timestamp quantile; classifier training splits event records. They need not select identical events if slate sizes vary. Its prior-click indicator also differs from the classifier's supplied-history count feature.
+
+The diagnostic run on 3 November 2026 measured popularity AUC **0.5275**, prior-click-overlap AUC **0.5346**, and combined AUC **0.5523**. A candidate appears in its own supplied history for **12.10% of positives** and **1.98% of negatives**; the overall positive rate is **6.29%**. These are simple baseline measurements, not an upper bound on what a learned interaction model can achieve. The rounded outputs are preserved in [JSON](results/diagnostics-2026-11-03.json).
 
 The cached training data has four time buckets and two day types. Both context embeddings were retained.
 
@@ -74,7 +76,7 @@ The model contains approximately 6.82 million parameters for the recorded vocabu
 3. **Cross-attention.** Each candidate attends to the encoded user history. A residual connection and layer normalization combine that information with the candidate representation.
 4. **Scoring head.** Concatenate the contextual candidate, attended history, and candidate history-count feature. A small MLP returns one logit per candidate; sigmoid converts it to a score for validation and prediction.
 
-The defaults are 64-dimensional embeddings, four attention heads, one layer per encoder, feed-forward width 256, and dropout 0.1.
+The defaults are 64-dimensional embeddings, four attention heads, one layer per encoder, feed-forward width 256, and dropout 0.25. The original recorded 30-epoch run used dropout 0.1.
 
 The objective is:
 
@@ -90,7 +92,11 @@ This implementation's ListNet term uses a single clicked-position target; it is 
 
 ## 6. Training schedule and GPU execution
 
-Training uses AdamW with learning rate `1e-3`, weight decay `1e-5`, batch size 512, gradient norm clipping at 5, and 30 epochs. Item embeddings are frozen in epochs 1–2 and become trainable at epoch 3. All parameters remain in the optimizer, so the unfreezing does not require adding a new parameter group.
+The Priority 1 defaults use AdamW with learning rate `3e-4`, weight decay `1e-3`, batch size 512, gradient norm clipping at 5, and a maximum of 15 epochs. Training stops after three consecutive validation epochs without a strict AUC improvement. A first checkpoint is saved even if its AUC is zero. Item embeddings are frozen in epochs 1–2 and become trainable at epoch 3. All parameters remain in the optimizer, so the unfreezing does not require adding a new parameter group.
+
+History dropout is enabled only for the training dataset. For histories longer than five items, each position is dropped with probability 0.15, with the final position always kept. The same selection is applied to item IDs and time gaps, and the unused tail is zero-padded. The cached arrays remain unchanged. Validation and prediction have augmentation disabled by default. The explicit candidate history-count feature continues to describe the original retained history; dropout changes the attention input.
+
+The original 30-epoch experiment instead used learning rate `1e-3`, weight decay `1e-5`, dropout 0.1, and no early stopping or history dropout. Its historical JSON retains those original settings.
 
 The learning-rate multiplier grows linearly from zero over the first 500 optimizer updates, then follows cosine decay over the planned run. The scheduler advances after each successful optimizer update, not after each epoch. If automatic mixed precision skips an overflowing update, the scheduler does not advance for that batch.
 

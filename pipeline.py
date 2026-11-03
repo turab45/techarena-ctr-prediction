@@ -87,6 +87,7 @@ class SlateDataset(Dataset):
     def __init__(self, events, item2idx, user2idx, max_hist=20, slate_size=10):
         n = len(events); self.S = slate_size
         self.item2idx = item2idx
+        self.training = False
         self.cand   = np.zeros((n, slate_size), dtype=np.int64)
         self.labels = np.zeros((n, slate_size), dtype=np.float32)
         self.hist   = np.zeros((n, max_hist),   dtype=np.int64)
@@ -134,12 +135,24 @@ class SlateDataset(Dataset):
     def __len__(self): return len(self.cand)
 
     def __getitem__(self, i):
+        hist = self.hist[i].copy()
+        hist_gap = self.hist_gap[i].copy()
+        hist_len = int(self.hist_len[i])
+        if self.training and hist_len > 5:
+            keep = np.random.rand(hist_len) > 0.15
+            keep[-1] = True
+            n_keep = int(keep.sum())
+            hist[:n_keep] = hist[:hist_len][keep]
+            hist_gap[:n_keep] = hist_gap[:hist_len][keep]
+            hist[n_keep:] = 0
+            hist_gap[n_keep:] = 0
+            hist_len = n_keep
         return dict(
             cand           = torch.from_numpy(self.cand[i]),
             labels         = torch.from_numpy(self.labels[i]),
-            hist           = torch.from_numpy(self.hist[i]),
-            hist_len       = torch.tensor(self.hist_len[i], dtype=torch.long),
-            hist_gap       = torch.from_numpy(self.hist_gap[i]),
+            hist           = torch.from_numpy(hist),
+            hist_len       = torch.tensor(hist_len, dtype=torch.long),
+            hist_gap       = torch.from_numpy(hist_gap),
             in_hist        = torch.from_numpy(self.in_hist[i]),
             user           = torch.tensor(self.user[i], dtype=torch.long),
             ts             = torch.tensor(self.ts[i], dtype=torch.long),
@@ -162,7 +175,7 @@ class ModelCfg:
     hist_layers: int = 1
     slate_layers: int = 1
     d_ff: int = 256
-    dropout: float = 0.1
+    dropout: float = 0.25
     max_hist: int = 20
     slate_size: int = 10
     gap_buckets: int = 64     # log-spaced hours
@@ -296,6 +309,8 @@ def make_loaders(args):
                          args.max_hist, args.slate_size)
     ds_va = SlateDataset(va_df, vocab['item2idx'], vocab['user2idx'],
                          args.max_hist, args.slate_size)
+    ds_tr.training = True
+    ds_va.training = False
     dl_tr = DataLoader(ds_tr, batch_size=args.bs, shuffle=True,
                        num_workers=args.workers, pin_memory=True, drop_last=True)
     dl_va = DataLoader(ds_va, batch_size=args.bs * 2, shuffle=False,
@@ -334,6 +349,7 @@ def cmd_train(args):
               f"{torch.cuda.get_device_name()}", flush=True)
     else:
         print("[device] cpu (explicitly requested)", flush=True)
+    Path("ckpts").mkdir(exist_ok=True)
     if not (CACHE/"item2vec.pkl").is_file():
         raise SystemExit(f"Missing {CACHE/'item2vec.pkl'}. "
                          "Run 'uv run python pretrain_item2vec.py' first.")
@@ -354,7 +370,7 @@ def cmd_train(args):
     print("[freeze] item embeddings frozen for epochs 1–2")
     print(f"[model] params={sum(p.numel() for p in model.parameters())/1e6:.2f}M")
 
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-3)
     warmup_steps = 500
     total_steps = args.epochs * len(dl_tr)
 
@@ -367,7 +383,8 @@ def cmd_train(args):
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
     scaler = GradScaler(device=dev)
 
-    best = 0.0
+    best = float('-inf')
+    patience, bad = 3, 0
     step = 0
     for ep in range(1, args.epochs + 1):
         if ep == 3:
@@ -399,11 +416,19 @@ def cmd_train(args):
         print(f"[ep {ep:02d}] loss={tot/len(dl_tr):.4f}  val_auc={auc:.5f}  "
               f"lr={opt.param_groups[0]['lr']:.2e}  "
               f"{time.time()-t0:.1f}s")
+        torch.save({"model": model.state_dict(), "cfg": asdict(cfg),
+                    "epoch": ep, "auc": auc},
+                   f"ckpts/epoch_{ep:02d}_auc_{auc:.5f}.pt")
         if auc > best:
-            best = auc
+            best, bad = auc, 0
             torch.save({"model": model.state_dict(), "cfg": asdict(cfg)},
                        "best_model.pt")
-            print(f"   ↳ saved  (best={best:.5f})")
+            print(f"   ↳ saved best  (best={best:.5f})")
+        else:
+            bad += 1
+            if bad >= patience:
+                print(f"[early-stop] no improvement for {patience} epochs")
+                break
     print(f"[done] best val AUC = {best:.5f}")
 
 
@@ -470,11 +495,11 @@ def main():
                    help="training device (default: cuda; no automatic CPU fallback)")
     t.add_argument("--val_frac", type=float, default=0.15)
     t.add_argument("--bs", type=int, default=512)
-    t.add_argument("--epochs", type=int, default=30)
-    t.add_argument("--lr", type=float, default=1e-3)
+    t.add_argument("--epochs", type=int, default=15)
+    t.add_argument("--lr", type=float, default=3e-4)
     t.add_argument("--d_model", type=int, default=64)
     t.add_argument("--n_heads", type=int, default=4)
-    t.add_argument("--dropout", type=float, default=0.1)
+    t.add_argument("--dropout", type=float, default=0.25)
     t.add_argument("--max_hist", type=int, default=20)
     t.add_argument("--slate_size", type=int, default=10)
     t.add_argument("--workers", type=int, default=8)

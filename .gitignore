@@ -6,6 +6,7 @@ preprocessed/
 artifacts/
 models/
 checkpoints/
+ckpts/
 submissions/
 packages/
 mf_packages/

@@ -62,15 +62,17 @@ uv run python diag.py
 uv run python pretrain_item2vec.py
 
 # 4. Train the classifier on CUDA.
-uv run python pipeline.py train --device cuda --epochs 30 --bs 512
+uv run python pipeline.py train --device cuda --epochs 15 --bs 512 --lr 3e-4
 
 # 5. Score evaluation candidates using the best saved checkpoint.
 uv run python pipeline.py predict
 ```
 
-Once item2vec has been generated, `bash test.sh` runs preparation and the 30-epoch training command. It does not run diagnostics, item2vec, prediction, or blending.
+Once item2vec has been generated, `bash test.sh` runs preparation and training for up to 15 epochs. It does not run diagnostics, item2vec, prediction, or blending.
 
-Training freezes item embeddings in epochs 1–2 and unfreezes them at epoch 3. It uses a learning rate of `1e-3`, 500 optimizer updates of linear warmup, then cosine decay. Each validation improvement overwrites `best_model.pt`; prediction reads that checkpoint rather than the final epoch's weights. The recorded run's best epoch was 4, while its final AUC was 0.77834. Early stopping is not implemented.
+Training freezes item embeddings in epochs 1–2 and unfreezes them at epoch 3. Current defaults use a learning rate of `3e-4`, dropout 0.25, AdamW weight decay `1e-3`, 500 optimizer updates of linear warmup, and cosine decay. Training stops after three consecutive epochs without a validation improvement. Each improvement overwrites `best_model.pt`; prediction reads that checkpoint rather than the final epoch's weights.
+
+During training only, histories longer than five items receive 15% item dropout, always retaining the latest position. Items and their age features are compacted together; validation and prediction use the full retained history. These Priority 1 regularization changes follow the original 30-epoch run, whose best epoch was 4 and final AUC was 0.77834. The original run and its settings remain preserved in the experiment record.
 
 Keep the vocabulary and evaluation cache from the same preparation run as the checkpoint. Caches are reused by filename; after changing input data, regenerate the corresponding caches, vocabulary, pretrained vectors, and model together.
 

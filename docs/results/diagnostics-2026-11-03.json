@@ -1,0 +1,16 @@
+{
+  "recorded_on": "2026-11-03",
+  "command": "uv run --locked python -u diag.py",
+  "source": "Executed locally alongside the Priority 1 training experiment",
+  "training_candidate_rows": 5837900,
+  "validation_candidate_rows": 1030340,
+  "popularity_auc_reported": 0.5275,
+  "prior_click_overlap_auc_reported": 0.5346,
+  "combined_auc_reported": 0.5523,
+  "positive_own_history_membership_reported": 0.1210,
+  "negative_own_history_membership_reported": 0.0198,
+  "time_bucket_unique": 4,
+  "day_type_unique": 2,
+  "positive_rate_reported": 0.0629,
+  "precision_note": "Diagnostic floats are the four-decimal values printed by diag.py."
+}

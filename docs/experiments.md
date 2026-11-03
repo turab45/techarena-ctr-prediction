@@ -1,6 +1,6 @@
 # Experiments and results
 
-The current result comes from the complete `bash test.sh` console log supplied on 3 November 2026. Training was not rerun to create these docs. All 30 epoch records are preserved in [JSON](results/training-2026-11-03.json).
+The original pretrained result below comes from the complete `bash test.sh` console log supplied on 3 November 2026. That baseline was not rerun to create its documentation. All 30 original epoch records are preserved in [JSON](results/training-2026-11-03.json). The subsequent Priority 1 experiment tests the updated regularization settings separately.
 
 ## Experiment progression
 
@@ -9,7 +9,7 @@ The current result comes from the complete `bash test.sh` console log supplied o
 | Randomly initialized transformer | 128-dimensional embeddings; two layers in each encoder | Earlier report described roughly 0.56 AUC. No complete baseline log is available here |
 | Numerical stability | Empty-history placeholder, minimum mask length, non-finite loss guard, AUC loss weight 0.1 | Removed the fully masked history path; recorded transformed history lengths are nonzero in both splits |
 | GPU execution and efficiency | CUDA required by default, explicit device output, batched pairwise loss, attention weights disabled | Model, candidate batch, and logits are reported on `cuda:0`; isolated loss benchmark is documented in [methods](methods.md#6-training-schedule-and-gpu-execution) |
-| Simple diagnostic baselines | Popularity, user click overlap, own-history overlap, and context variability | Script is implemented; numeric diagnostic AUC output was not supplied. Cached data has four time buckets and two day types |
+| Simple diagnostic baselines | Popularity, user click overlap, own-history overlap, and context variability | Measured popularity AUC 0.5275, prior-click overlap 0.5346, and combined 0.5523. Four time buckets and two day types |
 | Pretrained smaller transformer | Item2vec initialization; 64 dimensions; one layer per encoder; frozen item embeddings for two epochs; warmup/cosine schedule | **Best local validation AUC 0.81292 at epoch 4** in the supplied run |
 | Rank blending | CLI support for combining the transformer with an existing GBDT score file | Available but no resulting blend score is recorded for this transformer |
 
@@ -46,7 +46,7 @@ uv run --with matplotlib python docs/plot_training.py
 
 The first two epochs adapt the classifier with frozen item vectors. After unfreezing at epoch 3, validation AUC reaches 0.80884 and then peaks at 0.81292 in epoch 4. From epoch 4 to epoch 30, training loss falls from 0.6396 to 0.1497 while validation AUC falls to 0.77834. This pattern is consistent with overfitting after the early peak.
 
-The training loop saves a checkpoint only when AUC improves. For this recorded run, prediction therefore uses epoch 4's weights, assuming the checkpoint has not subsequently been overwritten by another run. The model does not currently stop early; an early-stopping rule is a possible future change, not an implemented feature.
+The training loop saves a checkpoint only when AUC improves. For this original recorded run, the saved checkpoint therefore contains epoch 4's weights. That run had no early stopping; the current Priority 1 loop stops after three non-improving epochs. Separate experiments can overwrite `best_model.pt`, so checkpoint provenance must be tracked when comparing runs.
 
 Reported epoch times range from 20.4 to 50.2 seconds. They exclude preparation and pretraining, and do not by themselves establish an end-to-end speedup over the previous implementation. The printed transformer nested-tensor warning concerns an unavailable optimization path with `norm_first=True`; the log also explicitly confirms CUDA tensors and completed GPU training.
 
@@ -91,4 +91,4 @@ This is a single local temporal validation run, with checkpoint selection using 
 
 Pretraining currently consumes histories from the full training and evaluation files, including snapshots beyond the supervised validation cutoff. It uses no click labels, but this is a transductive setup rather than a strictly isolated historical holdout. The supplied event histories are also used without additional filtering to enforce timestamps strictly before each event. A cutoff-restricted pretraining experiment and history timestamp audit are needed before claiming strictly causal validation performance.
 
-Useful next experiments are a fixed-seed matched comparison with random versus pretrained vectors, early stopping or a shorter training budget, stronger regularization, and a held-out comparison of transformer-only versus tree/transformer blends. These are proposed follow-ups; no scores for them are claimed here.
+The Priority 1 follow-up implements a shorter training budget, early stopping, stronger regularization, and history dropout. Other proposed follow-ups are a fixed-seed matched comparison with random versus pretrained vectors and a held-out comparison of transformer-only versus tree/transformer blends. No scores for those other follow-ups are claimed here.
