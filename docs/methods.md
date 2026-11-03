@@ -74,9 +74,11 @@ The model contains approximately 6.82 million parameters for the recorded vocabu
 1. **History encoder.** Add item, history-position, and bucketed-age embeddings. A transformer encoder contextualizes the history, with padding masked.
 2. **Candidate slate encoder.** Add candidate item, slate-position, user, time-bucket, and day-type embeddings. A separate transformer models relationships among candidates in the same event.
 3. **Cross-attention.** Each candidate attends to the encoded user history. A residual connection and layer normalization combine that information with the candidate representation.
-4. **Scoring head.** Concatenate the contextual candidate, attended history, and candidate history-count feature. A small MLP returns one logit per candidate; sigmoid converts it to a score for validation and prediction.
+4. **Scoring head.** Concatenate the contextual candidate, attended history, and ten numeric values: history count divided by 20, smoothed item CTR, log-scaled item exposure count/age, log-scaled user activity, smoothed user CTR, and sine/cosine encodings of UTC hour and weekday. A small MLP returns one logit per candidate; sigmoid converts it to a score for validation and prediction.
 
-The defaults are 64-dimensional embeddings, four attention heads, one layer per encoder, feed-forward width 256, and dropout 0.25. The original recorded 30-epoch run used dropout 0.1.
+The defaults are 64-dimensional embeddings, four attention heads, one layer per encoder, feed-forward width 256, and dropout 0.15. The original recorded 30-epoch run used dropout 0.1.
+
+P2 fits smoothed item/user statistics on the fitting portion only and reuses them unchanged for validation, so held-out labels do not enter those statistics. Training-row statistics do include their own fitting labels; this is aggregate target encoding, not an out-of-fold or strictly past-only encoding. Item age uses the aggregate last-seen timestamp and is clipped at zero. Prediction recomputes the statistics from the full labeled training cache as requested. Missing item/user statistics leave their numeric features at zero. The enlarged head has `2*d_model + 10` inputs. New checkpoints record this head version; older checkpoints use the original head and count scale.
 
 The objective is:
 
@@ -92,7 +94,7 @@ This implementation's ListNet term uses a single clicked-position target; it is 
 
 ## 6. Training schedule and GPU execution
 
-The Priority 1 defaults use AdamW with learning rate `3e-4`, weight decay `1e-3`, batch size 512, gradient norm clipping at 5, and a maximum of 15 epochs. Training stops after three consecutive validation epochs without a strict AUC improvement. A first checkpoint is saved even if its AUC is zero. Item embeddings are frozen in epochs 1–2 and become trainable at epoch 3. All parameters remain in the optimizer, so the unfreezing does not require adding a new parameter group.
+The current defaults use AdamW with learning rate `1e-3`, weight decay `1e-4`, batch size 512, gradient norm clipping at 5, and a maximum of 15 epochs. Training stops after three consecutive validation epochs without a strict AUC improvement. A first checkpoint is saved even if its AUC is zero. Item embeddings are frozen in epochs 1–2 and become trainable at epoch 3. All parameters remain in the optimizer, so the unfreezing does not require adding a new parameter group.
 
 History dropout is enabled only for the training dataset. For histories longer than five items, each position is dropped with probability 0.15, with the final position always kept. The same selection is applied to item IDs and time gaps, and the unused tail is zero-padded. The cached arrays remain unchanged. Validation and prediction have augmentation disabled by default. The explicit candidate history-count feature continues to describe the original retained history; dropout changes the attention input.
 

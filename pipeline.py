@@ -1,5 +1,6 @@
 # pipeline.py
 import argparse, json, math, pickle, time
+import datetime as dt
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
@@ -66,6 +67,37 @@ def build_vocab(*dfs):
     return item2idx, user2idx
 
 
+def compute_stats_from_events(events):
+    """Compute item/user statistics from labeled fitting events only."""
+    if 'labels' not in events.columns:
+        raise ValueError("Need labeled events to compute CTR stats")
+    item_clicks, item_n, item_last_seen = {}, {}, {}
+    user_n_events, user_n_clicks = {}, {}
+    global_clicks, global_n = 0, 0
+    for r in events.itertuples(index=False):
+        if len(r.items) != len(r.labels):
+            raise ValueError("Candidate items and labels must have matching lengths")
+        for item, label in zip(r.items, r.labels):
+            label = int(label)
+            item_clicks[item] = item_clicks.get(item, 0) + label
+            item_n[item] = item_n.get(item, 0) + 1
+            item_last_seen[item] = max(item_last_seen.get(item, r.timestamp), r.timestamp)
+        user_n_events[r.user_id] = user_n_events.get(r.user_id, 0) + 1
+        clicks = int(sum(r.labels))
+        user_n_clicks[r.user_id] = user_n_clicks.get(r.user_id, 0) + clicks
+        global_clicks += clicks
+        global_n += len(r.labels)
+    global_ctr = global_clicks / max(global_n, 1)
+    item_stats = {
+        item: ((item_clicks[item] + 10 * global_ctr) / (count + 10),
+               count, item_last_seen[item])
+        for item, count in item_n.items()
+    }
+    user_stats = {user: (count, user_n_clicks[user])
+                  for user, count in user_n_events.items()}
+    return item_stats, user_stats, global_ctr
+
+
 def cmd_prep(args):
     tr  = load_events("data/train.csv",      CACHE/"train.pkl", True)
     ev  = load_events("data/evaluation.csv", CACHE/"eval.pkl",  False)
@@ -84,7 +116,8 @@ def cmd_prep(args):
 # Dataset
 # ---------------------------------------------------------------------------
 class SlateDataset(Dataset):
-    def __init__(self, events, item2idx, user2idx, max_hist=20, slate_size=10):
+    def __init__(self, events, item2idx, user2idx, max_hist=20, slate_size=10,
+                 item_stats=None, user_stats=None, global_ctr=0.05):
         n = len(events); self.S = slate_size
         self.item2idx = item2idx
         self.training = False
@@ -98,12 +131,27 @@ class SlateDataset(Dataset):
         self.tb        = np.zeros(n, dtype=np.int64)
         self.dt        = np.zeros(n, dtype=np.int64)
         self.in_hist   = np.zeros((n, slate_size), dtype=np.float32)
+        self.item_ctr  = np.zeros((n, slate_size), dtype=np.float32)
+        self.item_pop  = np.zeros((n, slate_size), dtype=np.float32)
+        self.item_age  = np.zeros((n, slate_size), dtype=np.float32)
+        self.user_act  = np.zeros(n, dtype=np.float32)
+        self.user_ctr  = np.zeros(n, dtype=np.float32)
+        self.hour_sin  = np.zeros(n, dtype=np.float32)
+        self.hour_cos  = np.zeros(n, dtype=np.float32)
+        self.dow_sin   = np.zeros(n, dtype=np.float32)
+        self.dow_cos   = np.zeros(n, dtype=np.float32)
         has_lab = 'labels' in events.columns
 
         for i, r in enumerate(events.itertuples(index=False)):
             items = r.items[:slate_size]
             for j, it in enumerate(items):
                 self.cand[i, j] = item2idx.get(it, 0)
+                if item_stats is not None and it in item_stats:
+                    ctr, count, last_seen = item_stats[it]
+                    self.item_ctr[i, j] = ctr
+                    self.item_pop[i, j] = math.log1p(count) / 15.0
+                    age_hours = max(0.0, (r.timestamp - last_seen) / 3600.0)
+                    self.item_age[i, j] = math.log1p(age_hours) / 10.0
             if has_lab:
                 for j, l in enumerate(r.labels[:slate_size]):
                     self.labels[i, j] = float(l)
@@ -121,7 +169,17 @@ class SlateDataset(Dataset):
             cnts = {}
             for h in hist: cnts[h] = cnts.get(h, 0) + 1
             for j, it in enumerate(items):
-                self.in_hist[i, j] = cnts.get(it, 0)
+                self.in_hist[i, j] = cnts.get(it, 0) / 20.0
+            if user_stats is not None and r.user_id in user_stats:
+                activity, clicks = user_stats[r.user_id]
+                self.user_act[i] = math.log1p(activity) / 5.0
+                self.user_ctr[i] = (clicks + 10 * global_ctr) / (activity * 10 + 10)
+            timestamp = dt.datetime.fromtimestamp(int(r.timestamp), dt.timezone.utc)
+            hour = timestamp.hour + timestamp.minute / 60.0
+            self.hour_sin[i] = math.sin(2 * math.pi * hour / 24)
+            self.hour_cos[i] = math.cos(2 * math.pi * hour / 24)
+            self.dow_sin[i] = math.sin(2 * math.pi * timestamp.weekday() / 7)
+            self.dow_cos[i] = math.cos(2 * math.pi * timestamp.weekday() / 7)
             self.user[i] = user2idx.get(r.user_id, 0)
             self.ts[i]   = r.timestamp
             self.tb[i]   = int(r.time_bucket)
@@ -158,6 +216,15 @@ class SlateDataset(Dataset):
             ts             = torch.tensor(self.ts[i], dtype=torch.long),
             tb             = torch.tensor(self.tb[i], dtype=torch.long),
             dt             = torch.tensor(self.dt[i], dtype=torch.long),
+            item_ctr       = torch.from_numpy(self.item_ctr[i]),
+            item_pop       = torch.from_numpy(self.item_pop[i]),
+            item_age       = torch.from_numpy(self.item_age[i]),
+            user_act       = torch.tensor(self.user_act[i], dtype=torch.float32),
+            user_ctr       = torch.tensor(self.user_ctr[i], dtype=torch.float32),
+            hour_sin       = torch.tensor(self.hour_sin[i], dtype=torch.float32),
+            hour_cos       = torch.tensor(self.hour_cos[i], dtype=torch.float32),
+            dow_sin        = torch.tensor(self.dow_sin[i], dtype=torch.float32),
+            dow_cos        = torch.tensor(self.dow_cos[i], dtype=torch.float32),
         )
 
 
@@ -175,10 +242,11 @@ class ModelCfg:
     hist_layers: int = 1
     slate_layers: int = 1
     d_ff: int = 256
-    dropout: float = 0.25
+    dropout: float = 0.15
     max_hist: int = 20
     slate_size: int = 10
     gap_buckets: int = 64     # log-spaced hours
+    numeric_features: bool = True
 
 
 class Model(nn.Module):
@@ -224,7 +292,8 @@ class Model(nn.Module):
                                            batch_first=True)
         self.cross_norm = nn.LayerNorm(d)
         self.head = nn.Sequential(
-            nn.Linear(d * 2 + 1, d), nn.GELU(), nn.Dropout(cfg.dropout),
+            nn.Linear(d * 2 + (10 if cfg.numeric_features else 1), d),
+            nn.GELU(), nn.Dropout(cfg.dropout),
             nn.Linear(d, 1),
         )
 
@@ -246,7 +315,8 @@ class Model(nn.Module):
         return x, pad
 
     def forward(self, cand, hist, hist_len, hist_gap, in_hist,
-                user, tb, dt):
+                user, tb, dt, item_ctr, item_pop, item_age, user_act, user_ctr,
+                hour_sin, hour_cos, dow_sin, dow_cos):
         B, S = cand.shape
         hist_enc, hist_pad = self.encode_history(hist, hist_len, hist_gap)
 
@@ -261,8 +331,15 @@ class Model(nn.Module):
                                  key_padding_mask=hist_pad, need_weights=False)
         c = self.cross_norm(c + attended)
 
-        feat = torch.cat(
-            [c, attended, in_hist.unsqueeze(-1)], dim=-1)
+        if self.cfg.numeric_features:
+            cand_num = torch.stack([in_hist, item_ctr, item_pop, item_age], dim=-1)
+            event_num = torch.stack(
+                [user_act, user_ctr, hour_sin, hour_cos, dow_sin, dow_cos],
+                dim=-1).unsqueeze(1).expand(-1, S, -1)
+            feat = torch.cat([c, attended, cand_num, event_num], dim=-1)
+        else:
+            # Legacy checkpoints used unnormalised history counts and no numeric inputs.
+            feat = torch.cat([c, attended, (in_hist * 20).unsqueeze(-1)], dim=-1)
         logits = self.head(feat).squeeze(-1)       # [B, S]
         return logits
 
@@ -305,12 +382,23 @@ def make_loaders(args):
     va_df = tr_all[tr_all['timestamp'] >= cut_ts].reset_index(drop=True)
     print(f"[split] train={len(tr_df):,}  val={len(va_df):,}  cutoff={pd.to_datetime(cut_ts,unit='s')}")
 
+    print("[stats] computing item/user CTRs from train portion only")
+    item_stats, user_stats, global_ctr = compute_stats_from_events(tr_df)
+    print(f"[stats] {len(item_stats):,} items, {len(user_stats):,} users, "
+          f"global_ctr={global_ctr:.5f}")
     ds_tr = SlateDataset(tr_df, vocab['item2idx'], vocab['user2idx'],
-                         args.max_hist, args.slate_size)
+                         args.max_hist, args.slate_size,
+                         item_stats=item_stats, user_stats=user_stats, global_ctr=global_ctr)
     ds_va = SlateDataset(va_df, vocab['item2idx'], vocab['user2idx'],
-                         args.max_hist, args.slate_size)
+                         args.max_hist, args.slate_size,
+                         item_stats=item_stats, user_stats=user_stats, global_ctr=global_ctr)
     ds_tr.training = True
     ds_va.training = False
+    print(f"[stats] feature ranges: "
+          f"item_ctr=[0,{ds_tr.item_ctr.max():.2f}] "
+          f"item_pop=[0,{ds_tr.item_pop.max():.2f}] "
+          f"item_age=[0,{ds_tr.item_age.max():.2f}] "
+          f"user_act=[0,{ds_tr.user_act.max():.2f}]")
     dl_tr = DataLoader(ds_tr, batch_size=args.bs, shuffle=True,
                        num_workers=args.workers, pin_memory=True, drop_last=True)
     dl_va = DataLoader(ds_va, batch_size=args.bs * 2, shuffle=False,
@@ -324,7 +412,10 @@ def to_dev(batch, dev):
 
 def forward(model, b):
     return model(b['cand'], b['hist'], b['hist_len'], b['hist_gap'],
-                 b['in_hist'], b['user'], b['tb'], b['dt'])
+                 b['in_hist'], b['user'], b['tb'], b['dt'],
+                 b['item_ctr'], b['item_pop'], b['item_age'],
+                 b['user_act'], b['user_ctr'],
+                 b['hour_sin'], b['hour_cos'], b['dow_sin'], b['dow_cos'])
 
 
 @torch.no_grad()
@@ -370,7 +461,7 @@ def cmd_train(args):
     print("[freeze] item embeddings frozen for epochs 1–2")
     print(f"[model] params={sum(p.numel() for p in model.parameters())/1e6:.2f}M")
 
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-3)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     warmup_steps = 500
     total_steps = args.epochs * len(dl_tr)
 
@@ -439,14 +530,19 @@ def cmd_train(args):
 def cmd_predict(args):
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     ck = torch.load("best_model.pt", map_location=dev)
-    cfg = ModelCfg(**ck["cfg"])
+    cfg = ModelCfg(**{"numeric_features": False, **ck["cfg"]})
     model = Model(cfg).to(dev); model.load_state_dict(ck["model"]); model.eval()
 
     with open(CACHE/"vocab.pkl", "rb") as f:
         vocab = pickle.load(f)
     ev = pd.read_pickle(CACHE/"eval.pkl")
+    stats = {}
+    if cfg.numeric_features:
+        tr_full = pd.read_pickle(CACHE/"train.pkl")
+        item_stats, user_stats, global_ctr = compute_stats_from_events(tr_full)
+        stats = dict(item_stats=item_stats, user_stats=user_stats, global_ctr=global_ctr)
     ds = SlateDataset(ev, vocab['item2idx'], vocab['user2idx'],
-                      cfg.max_hist, cfg.slate_size)
+                      cfg.max_hist, cfg.slate_size, **stats)
     dl = DataLoader(ds, batch_size=args.bs * 2, shuffle=False,
                     num_workers=args.workers, pin_memory=True)
 
@@ -496,10 +592,10 @@ def main():
     t.add_argument("--val_frac", type=float, default=0.15)
     t.add_argument("--bs", type=int, default=512)
     t.add_argument("--epochs", type=int, default=15)
-    t.add_argument("--lr", type=float, default=3e-4)
+    t.add_argument("--lr", type=float, default=1e-3)
     t.add_argument("--d_model", type=int, default=64)
     t.add_argument("--n_heads", type=int, default=4)
-    t.add_argument("--dropout", type=float, default=0.25)
+    t.add_argument("--dropout", type=float, default=0.15)
     t.add_argument("--max_hist", type=int, default=20)
     t.add_argument("--slate_size", type=int, default=10)
     t.add_argument("--workers", type=int, default=8)

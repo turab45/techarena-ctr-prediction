@@ -102,12 +102,60 @@ class PretrainedTrainingTests(unittest.TestCase):
             pipeline.main()
         args = train.call_args.args[0]
         self.assertEqual((args.device, args.epochs, args.lr, args.d_model),
-                         ('cuda', 15, 3e-4, 64))
-        self.assertEqual(args.dropout, 0.25)
+                         ('cuda', 15, 1e-3, 64))
+        self.assertEqual(args.dropout, 0.15)
         cfg = pipeline.ModelCfg(num_items=4, num_users=3, num_tb=3, num_dt=3)
         self.assertEqual((cfg.d_model, cfg.hist_layers, cfg.slate_layers, cfg.d_ff),
                          (64, 1, 1, 256))
-        self.assertEqual(cfg.dropout, 0.25)
+        self.assertEqual(cfg.dropout, 0.15)
+        self.assertTrue(cfg.numeric_features)
+
+    def test_numeric_statistics_and_scaling(self):
+        items, users, global_ctr = pipeline.compute_stats_from_events(self.events)
+        self.assertEqual(global_ctr, 0.5)
+        self.assertEqual(items['known'], (0.5, 2, 7200))
+        self.assertEqual(users[1], (1, 1))
+        ds = pipeline.SlateDataset(
+            self.events, self.ds.item2idx, {1: 1, 2: 2}, max_hist=3, slate_size=2,
+            item_stats=items, user_stats=users, global_ctr=global_ctr)
+        row = ds[1]
+        self.assertAlmostEqual(row['item_ctr'][0].item(), 0.5)
+        self.assertAlmostEqual(row['item_pop'][0].item(), np.log1p(2) / 15)
+        self.assertEqual(row['item_age'][0].item(), 0)
+        self.assertAlmostEqual(row['user_act'].item(), np.log1p(1) / 5)
+        self.assertAlmostEqual(row['user_ctr'].item(), 0.3)
+        self.assertAlmostEqual(row['in_hist'][0].item(), 1 / 20)
+        self.assertAlmostEqual(row['hour_sin'].item(), 0.5)
+        self.assertAlmostEqual(row['hour_cos'].item(), np.sqrt(3) / 2)
+
+    def test_numeric_features_reach_the_head(self):
+        model = pipeline.Model(self.cfg).eval()
+        batch = next(iter(self.dl))
+        captured = []
+        hook = model.head[0].register_forward_pre_hook(
+            lambda module, args: captured.append(args[0].detach()))
+        try:
+            with torch.no_grad():
+                logits = pipeline.forward(model, batch)
+        finally:
+            hook.remove()
+        self.assertEqual(logits.shape, (2, 2))
+        self.assertTrue(torch.isfinite(logits).all().item())
+        expected_cand = torch.stack([batch[k] for k in
+                                    ('in_hist', 'item_ctr', 'item_pop', 'item_age')], dim=-1)
+        expected_event = torch.stack([batch[k] for k in
+                                     ('user_act', 'user_ctr', 'hour_sin', 'hour_cos',
+                                      'dow_sin', 'dow_cos')], dim=-1)
+        torch.testing.assert_close(captured[0][..., 16:20], expected_cand)
+        torch.testing.assert_close(captured[0][..., 20:], expected_event[:, None, :].expand(-1, 2, -1))
+
+    def test_stats_require_aligned_labeled_events(self):
+        with self.assertRaisesRegex(ValueError, 'Need labeled events'):
+            pipeline.compute_stats_from_events(self.events.drop(columns='labels'))
+        invalid = self.events.copy()
+        invalid.at[0, 'labels'] = [1]
+        with self.assertRaisesRegex(ValueError, 'matching lengths'):
+            pipeline.compute_stats_from_events(invalid)
 
     def check_training(self, device, auc_values=None):
         args = Namespace(device=device, d_model=8, n_heads=2, dropout=0,
@@ -135,7 +183,7 @@ class PretrainedTrainingTests(unittest.TestCase):
                     else 0.6 + len(observations) / 100)
 
         def scheduler(opt, fn):
-            self.assertEqual(opt.defaults['weight_decay'], 1e-3)
+            self.assertEqual(opt.defaults['weight_decay'], 1e-4)
             opt.register_step_post_hook(lambda *args: updates.append(1))
             result = original_scheduler(opt, fn)
             schedulers.append(result)
@@ -202,6 +250,11 @@ class PretrainedTrainingTests(unittest.TestCase):
         self.assertTrue(ds_tr.training)
         self.assertFalse(dl_va.dataset.training)
         self.assertFalse(self.ds.training)
+        before = dl_va.dataset.item_ctr.copy()
+        events.at[1, 'labels'] = [1, 0]
+        events.to_pickle(pipeline.CACHE/'train.pkl')
+        _, _, changed_val = pipeline.make_loaders(args)
+        np.testing.assert_array_equal(before, changed_val.dataset.item_ctr)
 
     def test_training_freeze_unfreeze_and_per_update_warmup(self):
         self.check_training('cpu')
