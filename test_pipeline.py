@@ -103,12 +103,13 @@ class PretrainedTrainingTests(unittest.TestCase):
         args = train.call_args.args[0]
         self.assertEqual((args.device, args.epochs, args.lr, args.d_model),
                          ('cuda', 15, 1e-3, 64))
-        self.assertEqual(args.dropout, 0.15)
+        self.assertEqual(args.dropout, 0.10)
         cfg = pipeline.ModelCfg(num_items=4, num_users=3, num_tb=3, num_dt=3)
         self.assertEqual((cfg.d_model, cfg.hist_layers, cfg.slate_layers, cfg.d_ff),
-                         (64, 1, 1, 256))
-        self.assertEqual(cfg.dropout, 0.15)
+                         (64, 2, 1, 256))
+        self.assertEqual(cfg.dropout, 0.10)
         self.assertTrue(cfg.numeric_features)
+        self.assertTrue(cfg.history_pooling)
 
     def test_numeric_statistics_and_scaling(self):
         items, users, global_ctr = pipeline.compute_stats_from_events(self.events)
@@ -121,7 +122,7 @@ class PretrainedTrainingTests(unittest.TestCase):
         row = ds[1]
         self.assertAlmostEqual(row['item_ctr'][0].item(), 0.5)
         self.assertAlmostEqual(row['item_pop'][0].item(), np.log1p(2) / 15)
-        self.assertEqual(row['item_age'][0].item(), 0)
+        self.assertNotIn('item_age', row)
         self.assertAlmostEqual(row['user_act'].item(), np.log1p(1) / 5)
         self.assertAlmostEqual(row['user_ctr'].item(), 0.3)
         self.assertAlmostEqual(row['in_hist'][0].item(), 1 / 20)
@@ -142,12 +143,41 @@ class PretrainedTrainingTests(unittest.TestCase):
         self.assertEqual(logits.shape, (2, 2))
         self.assertTrue(torch.isfinite(logits).all().item())
         expected_cand = torch.stack([batch[k] for k in
-                                    ('in_hist', 'item_ctr', 'item_pop', 'item_age')], dim=-1)
+                                    ('in_hist', 'item_ctr', 'item_pop')], dim=-1)
         expected_event = torch.stack([batch[k] for k in
                                      ('user_act', 'user_ctr', 'hour_sin', 'hour_cos',
                                       'dow_sin', 'dow_cos')], dim=-1)
-        torch.testing.assert_close(captured[0][..., 16:20], expected_cand)
-        torch.testing.assert_close(captured[0][..., 20:], expected_event[:, None, :].expand(-1, 2, -1))
+        offset = self.cfg.d_model * 5
+        self.assertEqual(captured[0].shape[-1], offset + 9)
+        torch.testing.assert_close(captured[0][..., offset:offset + 3], expected_cand)
+        torch.testing.assert_close(captured[0][..., offset + 3:], expected_event[:, None, :].expand(-1, 2, -1))
+
+    def test_history_pools_ignore_padding_and_select_last_valid_position(self):
+        model = pipeline.Model(self.cfg).eval()
+        encoded = torch.arange(72, dtype=torch.float32).reshape(3, 3, 8)
+        encoded[0, 1:] = 1000
+        encoded[1, 2] = 2000
+        hist = torch.zeros(3, 3, dtype=torch.long)
+        with patch.object(model.hist_enc, 'forward', return_value=encoded):
+            x, pad, mean, maximum, last = model.encode_history(
+                hist, torch.tensor([0, 2, 3]), torch.zeros(3, 3))
+        self.assertEqual(pad.tolist(), [[False, True, True],
+                                       [False, False, True], [False, False, False]])
+        for row, length in enumerate((1, 2, 3)):
+            torch.testing.assert_close(mean[row], x[row, :length].mean(0))
+            torch.testing.assert_close(maximum[row], x[row, :length].max(0).values)
+            torch.testing.assert_close(last[row], x[row, length - 1])
+        self.assertTrue(torch.isfinite(mean).all().item())
+        self.assertTrue(torch.isfinite(maximum).all().item())
+
+    def test_pooling_head_without_numeric_features(self):
+        cfg = pipeline.ModelCfg(**{**asdict(self.cfg), 'numeric_features': False})
+        model = pipeline.Model(cfg).eval()
+        self.assertEqual(model.head[0].in_features, cfg.d_model * 5 + 1)
+        with torch.no_grad():
+            logits = pipeline.forward(model, next(iter(self.dl)))
+        self.assertEqual(logits.shape, (2, 2))
+        self.assertTrue(torch.isfinite(logits).all().item())
 
     def test_stats_require_aligned_labeled_events(self):
         with self.assertRaisesRegex(ValueError, 'Need labeled events'):
@@ -183,7 +213,7 @@ class PretrainedTrainingTests(unittest.TestCase):
                     else 0.6 + len(observations) / 100)
 
         def scheduler(opt, fn):
-            self.assertEqual(opt.defaults['weight_decay'], 1e-4)
+            self.assertEqual(opt.defaults['weight_decay'], 1e-5)
             opt.register_step_post_hook(lambda *args: updates.append(1))
             result = original_scheduler(opt, fn)
             schedulers.append(result)
@@ -227,15 +257,15 @@ class PretrainedTrainingTests(unittest.TestCase):
         return observations, best_saves, output.getvalue()
 
     def test_early_stopping_preserves_best_checkpoint(self):
-        observations, saves, output = self.check_training('cpu', [0.6, 0.7, 0.69, 0.68, 0.67, 0.9])
-        self.assertEqual(len(observations), 5)
+        observations, saves, output = self.check_training('cpu', [0.6, 0.7, 0.69, 0.68, 0.67, 0.66, 0.9])
+        self.assertEqual(len(observations), 6)
         self.assertEqual(saves, 2)
-        self.assertIn('[early-stop] no improvement for 3 epochs', output)
+        self.assertIn('[early-stop] no improvement for 4 epochs', output)
         self.assertIn('[done] best val AUC = 0.70000', output)
 
     def test_zero_auc_still_saves_the_first_checkpoint(self):
-        observations, saves, output = self.check_training('cpu', [0.0, 0.0, 0.0, 0.0, 0.5])
-        self.assertEqual(len(observations), 4)
+        observations, saves, output = self.check_training('cpu', [0.0, 0.0, 0.0, 0.0, 0.0, 0.5])
+        self.assertEqual(len(observations), 5)
         self.assertEqual(saves, 1)
         self.assertIn('[done] best val AUC = 0.00000', output)
 
@@ -256,6 +286,22 @@ class PretrainedTrainingTests(unittest.TestCase):
         _, _, changed_val = pipeline.make_loaders(args)
         np.testing.assert_array_equal(before, changed_val.dataset.item_ctr)
 
+    def test_statistics_cache_is_written_and_reused(self):
+        events = self.events.copy()
+        events['timestamp'] = [7200, 14400]
+        events.to_pickle(pipeline.CACHE/'train.pkl')
+        with (pipeline.CACHE/'vocab.pkl').open('wb') as f:
+            pickle.dump({'item2idx': self.ds.item2idx, 'user2idx': {1: 1, 2: 2}}, f)
+        args = Namespace(val_frac=0.15, max_hist=3, slate_size=2, bs=1, workers=0)
+        with patch.object(pipeline, 'compute_stats_from_events',
+                          wraps=pipeline.compute_stats_from_events) as compute:
+            first, _, _ = pipeline.make_loaders(args)
+            second, _, _ = pipeline.make_loaders(args)
+        compute.assert_called_once()
+        self.assertEqual(len(list(pipeline.CACHE.glob('stats_*.pkl'))), 1)
+        np.testing.assert_array_equal(first.item_ctr, second.item_ctr)
+        np.testing.assert_array_equal(first.user_ctr, second.user_ctr)
+
     def test_training_freeze_unfreeze_and_per_update_warmup(self):
         self.check_training('cpu')
 
@@ -264,7 +310,7 @@ class PretrainedTrainingTests(unittest.TestCase):
         self.check_training('cuda')
 
 
-class HistoryDropoutTests(unittest.TestCase):
+class HistoryPreservationTests(unittest.TestCase):
     def setUp(self):
         events = pd.DataFrame([dict(
             items=[3, 8], labels=[1, 0], history_items=list(range(1, 9)),
@@ -273,30 +319,15 @@ class HistoryDropoutTests(unittest.TestCase):
         self.ds = pipeline.SlateDataset(events, {i: i for i in range(1, 9)}, {1: 1},
                                         max_hist=10, slate_size=2)
 
-    def test_training_dropout_keeps_items_and_gaps_aligned_without_mutation(self):
-        self.ds.training = True
-        draws = np.array([0.01, 0.9, 0.02, 0.8, 0.1, 0.99, 0.05, 0.0])
-        with patch.object(np.random, 'rand', return_value=draws):
-            row = self.ds[0]
-        self.assertEqual(row['hist_len'].item(), 4)
-        self.assertEqual(row['hist'].tolist(), [2, 4, 6, 8, 0, 0, 0, 0, 0, 0])
-        self.assertEqual(row['hist_gap'].tolist(), [7, 5, 3, 1, 0, 0, 0, 0, 0, 0])
-        self.assertEqual(self.ds.hist[0].tolist(), list(range(1, 9)) + [0, 0])
-        self.assertEqual(self.ds.hist_gap[0].tolist(), list(range(8, 0, -1)) + [0, 0])
-
-    def test_evaluation_and_prediction_do_not_drop_history(self):
-        with patch.object(np.random, 'rand', side_effect=AssertionError('Unexpected augmentation')):
-            row = self.ds[0]
-        self.assertEqual(row['hist_len'].item(), 8)
-        self.assertEqual(row['hist'].tolist(), list(range(1, 9)) + [0, 0])
-
-    def test_training_always_preserves_the_latest_item(self):
-        self.ds.training = True
-        with patch.object(np.random, 'rand', return_value=np.zeros(8)):
-            row = self.ds[0]
-        self.assertEqual(row['hist_len'].item(), 1)
-        self.assertEqual(row['hist'].tolist(), [8] + [0] * 9)
-        self.assertEqual(row['hist_gap'].tolist(), [1] + [0] * 9)
+    def test_all_modes_preserve_complete_history_and_aligned_gaps(self):
+        for training in (True, False):
+            with self.subTest(training=training):
+                self.ds.training = training
+                with patch.object(np.random, 'rand', side_effect=AssertionError('Unexpected augmentation')):
+                    row = self.ds[0]
+                self.assertEqual(row['hist_len'].item(), 8)
+                self.assertEqual(row['hist'].tolist(), list(range(1, 9)) + [0, 0])
+                self.assertEqual(row['hist_gap'].tolist(), list(range(8, 0, -1)) + [0, 0])
 
 
 if __name__ == '__main__':

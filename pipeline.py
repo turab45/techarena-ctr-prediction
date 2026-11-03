@@ -89,7 +89,7 @@ def compute_stats_from_events(events):
         global_n += len(r.labels)
     global_ctr = global_clicks / max(global_n, 1)
     item_stats = {
-        item: ((item_clicks[item] + 10 * global_ctr) / (count + 10),
+        item: ((item_clicks[item] + 5 * global_ctr) / (count + 5),
                count, item_last_seen[item])
         for item, count in item_n.items()
     }
@@ -133,7 +133,6 @@ class SlateDataset(Dataset):
         self.in_hist   = np.zeros((n, slate_size), dtype=np.float32)
         self.item_ctr  = np.zeros((n, slate_size), dtype=np.float32)
         self.item_pop  = np.zeros((n, slate_size), dtype=np.float32)
-        self.item_age  = np.zeros((n, slate_size), dtype=np.float32)
         self.user_act  = np.zeros(n, dtype=np.float32)
         self.user_ctr  = np.zeros(n, dtype=np.float32)
         self.hour_sin  = np.zeros(n, dtype=np.float32)
@@ -147,11 +146,9 @@ class SlateDataset(Dataset):
             for j, it in enumerate(items):
                 self.cand[i, j] = item2idx.get(it, 0)
                 if item_stats is not None and it in item_stats:
-                    ctr, count, last_seen = item_stats[it]
+                    ctr, count, _ = item_stats[it]
                     self.item_ctr[i, j] = ctr
                     self.item_pop[i, j] = math.log1p(count) / 15.0
-                    age_hours = max(0.0, (r.timestamp - last_seen) / 3600.0)
-                    self.item_age[i, j] = math.log1p(age_hours) / 10.0
             if has_lab:
                 for j, l in enumerate(r.labels[:slate_size]):
                     self.labels[i, j] = float(l)
@@ -193,18 +190,9 @@ class SlateDataset(Dataset):
     def __len__(self): return len(self.cand)
 
     def __getitem__(self, i):
-        hist = self.hist[i].copy()
-        hist_gap = self.hist_gap[i].copy()
+        hist = self.hist[i]
+        hist_gap = self.hist_gap[i]
         hist_len = int(self.hist_len[i])
-        if self.training and hist_len > 5:
-            keep = np.random.rand(hist_len) > 0.15
-            keep[-1] = True
-            n_keep = int(keep.sum())
-            hist[:n_keep] = hist[:hist_len][keep]
-            hist_gap[:n_keep] = hist_gap[:hist_len][keep]
-            hist[n_keep:] = 0
-            hist_gap[n_keep:] = 0
-            hist_len = n_keep
         return dict(
             cand           = torch.from_numpy(self.cand[i]),
             labels         = torch.from_numpy(self.labels[i]),
@@ -218,7 +206,6 @@ class SlateDataset(Dataset):
             dt             = torch.tensor(self.dt[i], dtype=torch.long),
             item_ctr       = torch.from_numpy(self.item_ctr[i]),
             item_pop       = torch.from_numpy(self.item_pop[i]),
-            item_age       = torch.from_numpy(self.item_age[i]),
             user_act       = torch.tensor(self.user_act[i], dtype=torch.float32),
             user_ctr       = torch.tensor(self.user_ctr[i], dtype=torch.float32),
             hour_sin       = torch.tensor(self.hour_sin[i], dtype=torch.float32),
@@ -239,14 +226,15 @@ class ModelCfg:
     num_dt: int
     d_model: int = 64
     n_heads: int = 4
-    hist_layers: int = 1
+    hist_layers: int = 2
     slate_layers: int = 1
     d_ff: int = 256
-    dropout: float = 0.15
+    dropout: float = 0.10
     max_hist: int = 20
     slate_size: int = 10
     gap_buckets: int = 64     # log-spaced hours
     numeric_features: bool = True
+    history_pooling: bool = True
 
 
 class Model(nn.Module):
@@ -292,7 +280,8 @@ class Model(nn.Module):
                                            batch_first=True)
         self.cross_norm = nn.LayerNorm(d)
         self.head = nn.Sequential(
-            nn.Linear(d * 2 + (10 if cfg.numeric_features else 1), d),
+            nn.Linear(d * (5 if cfg.history_pooling else 2)
+                      + (9 if cfg.numeric_features else 1), d),
             nn.GELU(), nn.Dropout(cfg.dropout),
             nn.Linear(d, 1),
         )
@@ -312,13 +301,19 @@ class Model(nn.Module):
         x = x + self.hist_pos(pos) + self.gap_emb(self._gap_bucket(hist_gap))
         pad = torch.arange(L, device=hist.device)[None, :] >= hist_len.clamp(min=1)[:, None]
         x = self.hist_enc(x, src_key_padding_mask=pad)
-        return x, pad
+        valid = (~pad).unsqueeze(-1).float()
+        hist_mean = (x * valid).sum(1) / valid.sum(1).clamp(min=1)
+        hist_max = x.masked_fill(pad.unsqueeze(-1), float('-inf')).max(1).values
+        last_idx = hist_len.clamp(min=1) - 1
+        hist_last = x[torch.arange(B, device=x.device), last_idx]
+        return x, pad, hist_mean, hist_max, hist_last
 
     def forward(self, cand, hist, hist_len, hist_gap, in_hist,
-                user, tb, dt, item_ctr, item_pop, item_age, user_act, user_ctr,
+                user, tb, dt, item_ctr, item_pop, user_act, user_ctr,
                 hour_sin, hour_cos, dow_sin, dow_cos):
         B, S = cand.shape
-        hist_enc, hist_pad = self.encode_history(hist, hist_len, hist_gap)
+        hist_enc, hist_pad, hist_mean, hist_max, hist_last = self.encode_history(
+            hist, hist_len, hist_gap)
 
         c = self.item_emb(cand)
         pos = torch.arange(1, S + 1, device=cand.device).unsqueeze(0).expand(B, S)
@@ -331,15 +326,21 @@ class Model(nn.Module):
                                  key_padding_mask=hist_pad, need_weights=False)
         c = self.cross_norm(c + attended)
 
+        features = [c, attended]
+        if self.cfg.history_pooling:
+            hm = hist_mean.unsqueeze(1).expand(-1, S, -1)
+            hx = hist_max.unsqueeze(1).expand(-1, S, -1)
+            hl = hist_last.unsqueeze(1).expand(-1, S, -1)
+            features.extend([hm, hx, hl])
         if self.cfg.numeric_features:
-            cand_num = torch.stack([in_hist, item_ctr, item_pop, item_age], dim=-1)
+            cand_num = torch.stack([in_hist, item_ctr, item_pop], dim=-1)
             event_num = torch.stack(
                 [user_act, user_ctr, hour_sin, hour_cos, dow_sin, dow_cos],
                 dim=-1).unsqueeze(1).expand(-1, S, -1)
-            feat = torch.cat([c, attended, cand_num, event_num], dim=-1)
+            feat = torch.cat([*features, cand_num, event_num], dim=-1)
         else:
             # Legacy checkpoints used unnormalised history counts and no numeric inputs.
-            feat = torch.cat([c, attended, (in_hist * 20).unsqueeze(-1)], dim=-1)
+            feat = torch.cat([*features, (in_hist * 20).unsqueeze(-1)], dim=-1)
         logits = self.head(feat).squeeze(-1)       # [B, S]
         return logits
 
@@ -382,8 +383,17 @@ def make_loaders(args):
     va_df = tr_all[tr_all['timestamp'] >= cut_ts].reset_index(drop=True)
     print(f"[split] train={len(tr_df):,}  val={len(va_df):,}  cutoff={pd.to_datetime(cut_ts,unit='s')}")
 
-    print("[stats] computing item/user CTRs from train portion only")
-    item_stats, user_stats, global_ctr = compute_stats_from_events(tr_df)
+    # shortcut: cutoff-only key; delete stats_*.pkl when replacing train.pkl.
+    stats_cache = CACHE / f"stats_{int(cut_ts)}.pkl"
+    if stats_cache.exists():
+        print(f"[stats] loading {stats_cache}")
+        with open(stats_cache, "rb") as f:
+            item_stats, user_stats, global_ctr = pickle.load(f)
+    else:
+        print("[stats] computing item/user CTRs from train portion only")
+        item_stats, user_stats, global_ctr = compute_stats_from_events(tr_df)
+        with open(stats_cache, "wb") as f:
+            pickle.dump((item_stats, user_stats, global_ctr), f)
     print(f"[stats] {len(item_stats):,} items, {len(user_stats):,} users, "
           f"global_ctr={global_ctr:.5f}")
     ds_tr = SlateDataset(tr_df, vocab['item2idx'], vocab['user2idx'],
@@ -397,7 +407,6 @@ def make_loaders(args):
     print(f"[stats] feature ranges: "
           f"item_ctr=[0,{ds_tr.item_ctr.max():.2f}] "
           f"item_pop=[0,{ds_tr.item_pop.max():.2f}] "
-          f"item_age=[0,{ds_tr.item_age.max():.2f}] "
           f"user_act=[0,{ds_tr.user_act.max():.2f}]")
     dl_tr = DataLoader(ds_tr, batch_size=args.bs, shuffle=True,
                        num_workers=args.workers, pin_memory=True, drop_last=True)
@@ -413,7 +422,7 @@ def to_dev(batch, dev):
 def forward(model, b):
     return model(b['cand'], b['hist'], b['hist_len'], b['hist_gap'],
                  b['in_hist'], b['user'], b['tb'], b['dt'],
-                 b['item_ctr'], b['item_pop'], b['item_age'],
+                 b['item_ctr'], b['item_pop'],
                  b['user_act'], b['user_ctr'],
                  b['hour_sin'], b['hour_cos'], b['dow_sin'], b['dow_cos'])
 
@@ -461,7 +470,7 @@ def cmd_train(args):
     print("[freeze] item embeddings frozen for epochs 1–2")
     print(f"[model] params={sum(p.numel() for p in model.parameters())/1e6:.2f}M")
 
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
     warmup_steps = 500
     total_steps = args.epochs * len(dl_tr)
 
@@ -475,7 +484,7 @@ def cmd_train(args):
     scaler = GradScaler(device=dev)
 
     best = float('-inf')
-    patience, bad = 3, 0
+    patience, bad = 4, 0
     step = 0
     for ep in range(1, args.epochs + 1):
         if ep == 3:
@@ -530,7 +539,7 @@ def cmd_train(args):
 def cmd_predict(args):
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     ck = torch.load("best_model.pt", map_location=dev)
-    cfg = ModelCfg(**{"numeric_features": False, **ck["cfg"]})
+    cfg = ModelCfg(**{"numeric_features": False, "history_pooling": False, **ck["cfg"]})
     model = Model(cfg).to(dev); model.load_state_dict(ck["model"]); model.eval()
 
     with open(CACHE/"vocab.pkl", "rb") as f:
@@ -557,7 +566,7 @@ def cmd_predict(args):
     for i, r in enumerate(ev.itertuples(index=False)):
         for j, rid in enumerate(r.rowids):
             rows.append((rid, float(scores[i, j])))
-    sub = pd.DataFrame(rows, columns=["rowid", "score"])
+    sub = pd.DataFrame(rows, columns=["rowid", "predicted_probability"])
     sub.to_csv("submission_dl.csv", index=False)
     print(f"[predict] wrote submission_dl.csv  rows={len(sub)}")
     print(sub.head())
@@ -568,12 +577,14 @@ def cmd_predict(args):
 # ---------------------------------------------------------------------------
 def cmd_blend(args):
     """Rank-average two rowid-scored files (e.g. GBDT + transformer)."""
-    a = pd.read_csv(args.a)[["rowid", "score"]].rename(columns={"score": "s_a"})
-    b = pd.read_csv(args.b)[["rowid", "score"]].rename(columns={"score": "s_b"})
+    a = pd.read_csv(args.a)[["rowid", "predicted_probability"]].rename(
+        columns={"predicted_probability": "s_a"})
+    b = pd.read_csv(args.b)[["rowid", "predicted_probability"]].rename(
+        columns={"predicted_probability": "s_b"})
     m = a.merge(b, on="rowid")
-    m["score"] = (args.wa * m["s_a"].rank(pct=True)
-                  + (1 - args.wa) * m["s_b"].rank(pct=True))
-    m[["rowid", "score"]].to_csv(args.out, index=False)
+    m["predicted_probability"] = (args.wa * m["s_a"].rank(pct=True)
+                                  + (1 - args.wa) * m["s_b"].rank(pct=True))
+    m[["rowid", "predicted_probability"]].to_csv(args.out, index=False)
     print(f"[blend] wrote {args.out}  rows={len(m)}")
 
 
@@ -595,7 +606,7 @@ def main():
     t.add_argument("--lr", type=float, default=1e-3)
     t.add_argument("--d_model", type=int, default=64)
     t.add_argument("--n_heads", type=int, default=4)
-    t.add_argument("--dropout", type=float, default=0.15)
+    t.add_argument("--dropout", type=float, default=0.10)
     t.add_argument("--max_hist", type=int, default=20)
     t.add_argument("--slate_size", type=int, default=10)
     t.add_argument("--workers", type=int, default=8)

@@ -26,7 +26,7 @@ flowchart LR
 
 The scoring head also receives the count of each candidate in the user's history. Candidate representations include user, position, time-bucket, and day-type embeddings. Training combines binary cross-entropy, ListNet, and a smooth pairwise AUC objective.
 
-P2 adds item CTR, popularity, time since last item exposure, user activity/CTR, and cyclic UTC hour/day-of-week features. Together with normalized history overlap, the head receives ten numeric values per candidate. Validation statistics come only from the fitting split; prediction recomputes statistics from the full labeled training file. Earlier checkpoints remain loadable using their original head and history-count scale. No P2 training result is recorded yet.
+P2 adds item CTR, popularity, user activity/CTR, and cyclic UTC hour/day-of-week features. Together with normalized history overlap, the head receives nine numeric values per candidate. Candidate `item_age` has been removed. Validation statistics come only from the fitting split; prediction recomputes statistics from the full labeled training file. Original checkpoints without numeric features remain loadable using their original head and history-count scale. The former ten-feature P2 checkpoints require retraining for the new nine-feature head. No new P2 training result is recorded yet.
 
 - [Methods and implementation](docs/methods.md): preprocessing, diagnostics, model, losses, GPU changes, and reference methods.
 - [Experiments and results](docs/experiments.md): what we tried, the complete 30-epoch record, and current limitations.
@@ -72,9 +72,9 @@ uv run python pipeline.py predict
 
 Once item2vec has been generated, `bash test.sh` runs preparation and training for up to 15 epochs. It does not run diagnostics, item2vec, prediction, or blending.
 
-Training freezes item embeddings in epochs 1–2 and unfreezes them at epoch 3. Current defaults use a learning rate of `1e-3`, dropout 0.15, AdamW weight decay `1e-4`, 500 optimizer updates of linear warmup, and cosine decay. Training stops after three consecutive epochs without a validation improvement. Each completed epoch is saved under `ckpts/` with its AUC in the filename; improvements also overwrite `best_model.pt`. Prediction reads that best checkpoint rather than the final epoch's weights.
+Training freezes item embeddings in epochs 1–2 and unfreezes them at epoch 3. Current defaults use a learning rate of `1e-3`, dropout 0.10, AdamW weight decay `1e-5`, 500 optimizer updates of linear warmup, and cosine decay. Training stops after four consecutive epochs without a validation improvement. Each completed epoch is saved under `ckpts/` with its AUC in the filename; improvements also overwrite `best_model.pt`. Prediction reads that best checkpoint rather than the final epoch's weights.
 
-During training only, histories longer than five items receive 15% item dropout, always retaining the latest position. Items and their age features are compacted together; validation and prediction use the full retained history. These Priority 1 regularization changes follow the original 30-epoch run, whose best epoch was 4 and final AUC was 0.77834. The original run and its settings remain preserved in the experiment record.
+History dropout has been removed: training, validation, and prediction all use the full retained history with aligned time gaps. The `self.training` dataset flag remains for compatibility but no longer changes samples. The original 30-epoch run, whose best epoch was 4 and final AUC was 0.77834, remains preserved in the experiment record.
 
 Keep the vocabulary and evaluation cache from the same preparation run as the checkpoint. Caches are reused by filename; after changing input data, regenerate the corresponding caches, vocabulary, pretrained vectors, and model together.
 
@@ -86,7 +86,7 @@ Keep the vocabulary and evaluation cache from the same preparation run as the ch
 | `cache/vocab.pkl` | Item/user IDs mapped to embedding indices |
 | `cache/item2vec.pkl` | Pretrained item vectors |
 | `best_model.pt` | Best validation checkpoint and model configuration |
-| `submission_dl.csv` | Evaluation `rowid,score` pairs |
+| `submission_dl.csv` | Evaluation `rowid,predicted_probability` pairs |
 
 The pipeline can rank-average an existing GBDT submission with the transformer scores:
 
