@@ -1,4 +1,5 @@
 data/
+/cache/
 /.git-backup/
 # Competition submissions and local prediction artifacts
 submission*.csv
