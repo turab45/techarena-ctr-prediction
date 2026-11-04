@@ -1,0 +1,72 @@
+{
+  "cutoff": 1737846840,
+  "cohorts": {
+    "all_validation": {
+      "events": 103034,
+      "auc": 0.833444072800918,
+      "positive_rate": 0.0629549469107285,
+      "median_history_age_days": 0.34444444444444444
+    },
+    "first_after_cutoff": {
+      "events": 35810,
+      "auc": 0.8209194450317197,
+      "positive_rate": 0.0633845294610444,
+      "median_history_age_days": 1.0444444444444445
+    },
+    "day6_first": {
+      "events": 35138,
+      "auc": 0.8210105094768152,
+      "positive_rate": 0.06336729466674255,
+      "median_history_age_days": 1.025
+    }
+  },
+  "evaluation": {
+    "events": 52939,
+    "users": 52939,
+    "day_counts": {
+      "7": 35269,
+      "8": 8764,
+      "9": 3914,
+      "10": 2236,
+      "11": 1273,
+      "12": 898,
+      "13": 585
+    }
+  },
+  "tr_history_age_days": {
+    "0.25": 0.10486111111111111,
+    "0.5": 0.35208333333333336,
+    "0.75": 0.9590277777777778,
+    "0.9": 2.1631944444444446,
+    "0.99": 7.7875
+  },
+  "tr_history_after_training_end_fraction": 0.0,
+  "ev_history_age_days": {
+    "0.25": 0.7826388888888889,
+    "0.5": 1.7729166666666667,
+    "0.75": 3.897222222222222,
+    "0.9": 7.164166666666673,
+    "0.99": 16.875055555555548
+  },
+  "ev_history_after_training_end_fraction": 0.0,
+  "score_experiment": {
+    "selection": "random_seed_2026_disjoint_user_halves_of_day6_first",
+    "tuning_events": 17569,
+    "check_events": 17569,
+    "tuning_auc": {
+      "baseline": 0.8182805824114818,
+      "warm_logit_weight_0.1": 0.8183801910425005,
+      "warm_logit_weight_0.25": 0.8172842243830973,
+      "warm_logit_weight_0.5": 0.8127737680407733,
+      "warm_logit_weight_0.75": 0.8058203672814457,
+      "warm_logit_weight_1.0": 0.797319399053859,
+      "slate_normalization_0.25": 0.8184471212126363,
+      "slate_normalization_0.5": 0.8177971729116971,
+      "slate_normalization_1.0": 0.8137334479163905
+    },
+    "selected": "slate_normalization_0.25",
+    "baseline_check_auc": 0.8237511248006172,
+    "selected_check_auc": 0.8238628520710916,
+    "warning": "Exploratory; confirm on an earlier frozen-cutoff fold before submission."
+  }
+}

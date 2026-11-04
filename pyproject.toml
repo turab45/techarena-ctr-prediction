@@ -15,4 +15,5 @@ dependencies = [
     "pyarrow>=21.0.0",
     "scikit-learn>=1.6.1",
     "torch>=2.8.0",
+    "xgboost>=2.1.4",
 ]

@@ -1,5 +1,10 @@
 data/
 /.git-backup/
+# Competition submissions and local prediction artifacts
+submission*.csv
+submission*.parquet
+# Local operating-system metadata
+.DS_Store
 cache/
 processed/
 preprocessed/
