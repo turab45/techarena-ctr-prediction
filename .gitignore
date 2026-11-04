@@ -5,7 +5,6 @@ submission*.csv
 submission*.parquet
 # Local operating-system metadata
 .DS_Store
-cache/
 processed/
 preprocessed/
 artifacts/
